@@ -1,6 +1,8 @@
 # taskboard-agent-orchestrator
 秘書AI・タスクボード仲介型AIエージェント実行基盤
 
+基本ワークフローから分解した実装用ユースケースは [docs/use-cases.md](docs/use-cases.md) に整理する。
+
 ## 秘書AI・タスクボード仲介型 AIエージェント実行基盤
 
 ### 1. 企画概要
