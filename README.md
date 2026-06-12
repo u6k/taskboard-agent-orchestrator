@@ -1,6 +1,39 @@
 # taskboard-agent-orchestrator
 秘書AI・タスクボード仲介型AIエージェント実行基盤
 
+## Redmine AI担当チケット確認 v1
+
+RedmineでAIユーザーが担当している未終了チケットを1件だけ取得し、OpenAIでDescriptionを目的・実施内容・完了条件・課題・元文章の形式に整理します。そのうえで、何をしたかとユーザーに何を確認してほしいかをコメントに残し、担当者をチケット作成者へ戻す one-shot CLI です。
+
+### セットアップ
+
+```powershell
+uv sync
+Copy-Item .env.example .env
+```
+
+`.env` に以下を設定します。実環境変数が同名で定義されている場合は、実環境変数が優先されます。
+
+```dotenv
+REDMINE_URL=https://redmine.example.com
+REDMINE_API_KEY=replace-with-redmine-api-key
+REDMINE_AI_USER_ID=123
+OPENAI_API_KEY=replace-with-openai-api-key
+OPENAI_MODEL=replace-with-openai-model
+```
+
+### 実行
+
+```powershell
+uv run taskboard-agent run-once
+```
+
+Redmineを更新せずに取得、Description生成、コメント生成だけ確認する場合:
+
+```powershell
+uv run taskboard-agent run-once --dry-run
+```
+
 基本ワークフローから分解した実装用ユースケースは [docs/use-cases.md](docs/use-cases.md) に整理する。
 
 ## 秘書AI・タスクボード仲介型 AIエージェント実行基盤
