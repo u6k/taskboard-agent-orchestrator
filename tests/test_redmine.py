@@ -62,3 +62,33 @@ def test_update_description_note_and_reassign_sends_description_notes_and_assign
             "assigned_to_id": 7,
         }
     }
+
+
+def test_update_issue_sends_notes_status_and_assignment() -> None:
+    seen_body: dict[str, object] | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_body
+        seen_body = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(204)
+
+    client = RedmineClient(
+        "https://redmine.example.test",
+        "api-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.update_issue(
+        123,
+        notes="ブックマークを登録しました。",
+        assigned_to_id=7,
+        status_id=10,
+    )
+
+    assert seen_body == {
+        "issue": {
+            "notes": "ブックマークを登録しました。",
+            "assigned_to_id": 7,
+            "status_id": 10,
+        }
+    }

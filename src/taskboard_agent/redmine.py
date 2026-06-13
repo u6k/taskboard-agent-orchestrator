@@ -61,15 +61,37 @@ class RedmineClient:
         notes: str,
         assigned_to_id: int,
     ) -> None:
+        self.update_issue(
+            issue_id,
+            description=description,
+            notes=notes,
+            assigned_to_id=assigned_to_id,
+        )
+
+    def update_issue(
+        self,
+        issue_id: int,
+        *,
+        notes: str | None = None,
+        assigned_to_id: int | None = None,
+        status_id: int | None = None,
+        description: str | None = None,
+    ) -> None:
+        issue: dict[str, Any] = {}
+        if notes is not None:
+            issue["notes"] = notes
+        if assigned_to_id is not None:
+            issue["assigned_to_id"] = assigned_to_id
+        if status_id is not None:
+            issue["status_id"] = status_id
+        if description is not None:
+            issue["description"] = description
+        if not issue:
+            return
+
         response = self._client.put(
             f"/issues/{issue_id}.json",
-            json={
-                "issue": {
-                    "description": description,
-                    "notes": notes,
-                    "assigned_to_id": assigned_to_id,
-                }
-            },
+            json={"issue": issue},
         )
         if response.status_code >= 400:
             raise RedmineError(

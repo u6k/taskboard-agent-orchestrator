@@ -22,9 +22,18 @@ Copy-Item .env.example .env
 REDMINE_URL=https://redmine.example.com
 REDMINE_API_KEY=replace-with-redmine-api-key
 REDMINE_AI_USER_ID=123
+REDMINE_IN_PROGRESS_STATUS_ID=2
+REDMINE_REVIEW_STATUS_ID=10
 OPENAI_API_KEY=replace-with-openai-api-key
 OPENAI_MODEL=replace-with-openai-model
+LINKACE_URL=https://linkace.example.com
+LINKACE_API_KEY=replace-with-linkace-api-key
+LINKACE_SUMMARIZED_LIST_ID=10
 ```
+
+`LINKACE_API_KEY` には、LinkAceのユーザー設定またはシステム設定で作成したAPIトークンの実体を設定します。トークン名や作成後の一覧に表示される識別情報ではなく、作成直後に表示されるトークン文字列を保存してください。LinkAce API が 401 を返す場合は、トークンの値、失効有無、API権限を確認してください。
+
+LinkAce登録時、ブリーフィング要約を生成する前に同じURLのブックマークが既に存在するか確認します。既存ブックマークがリスト `id=1` に入っている場合は、新規作成ではなく既存ブックマークを更新してリスト `id=10` へ移します。既存ブックマークがリスト `id=1` に入っていない場合は、要約せずに「ブックマークが登録済みです。」とブックマークURLをRedmineへコメントし、担当者を起票者へ戻してレビュー中にします。
 
 ### 実行
 
@@ -32,7 +41,7 @@ OPENAI_MODEL=replace-with-openai-model
 uv run taskboard-agent run-once
 ```
 
-Redmineを更新せずに取得、計画生成、コメント生成だけ確認する場合:
+RedmineとLinkAceを更新せずに、AI判定、ページ本文抽出、ブリーフィング要約だけ確認する場合:
 
 ```powershell
 uv run taskboard-agent run-once --dry-run
