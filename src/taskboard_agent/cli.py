@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 from taskboard_agent.config import ConfigError, load_config
 from taskboard_agent.linkace import LinkAceClient, LinkAceError
+from taskboard_agent.logging_config import configure_logging, log_trace
 from taskboard_agent.llm import (
     CommentGenerationError,
     OpenAIBriefingSummarizer,
@@ -13,6 +15,9 @@ from taskboard_agent.llm import (
 from taskboard_agent.page import PageFetchError, WebPageExtractor
 from taskboard_agent.redmine import RedmineClient, RedmineError
 from taskboard_agent.workflow import WorkflowError, run_once
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,12 +40,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_logging("logging.conf")
     parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.command != "run-once":
         parser.error(f"unknown command: {args.command}")
 
+    with log_trace("run-once"):
+        logger.info("CLIを開始します command=%s dry_run=%s", args.command, args.dry_run)
     try:
         config = load_config()
         redmine = RedmineClient(config.redmine_url, config.redmine_api_key)
@@ -71,14 +79,20 @@ def main(argv: list[str] | None = None) -> int:
         RedmineError,
         WorkflowError,
     ) as exc:
+        with log_trace("run-once"):
+            logger.warning("CLI実行中に例外が発生しました", exc_info=True)
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if result.status == "no_issue":
+        with log_trace("run-once"):
+            logger.info("CLIを終了します status=no_issue")
         print("No open Redmine issues are assigned to the AI user.")
         return 0
 
     if result.dry_run:
+        with log_trace(f"issue#{result.issue_id}" if result.issue_id else "run-once"):
+            logger.info("CLIを終了します status=%s dry_run=True", result.status)
         print(
             f"Dry run complete for issue #{result.issue_id}; Redmine and LinkAce were not updated."
         )
@@ -103,6 +117,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(comment)
         return 0
 
+    with log_trace(f"issue#{result.issue_id}" if result.issue_id else "run-once"):
+        logger.info(
+            "CLIを終了します status=%s reassigned_to_id=%s",
+            result.status,
+            result.reassigned_to_id,
+        )
     print(
         "Processed issue "
         f"#{result.issue_id}; generated briefing, registered bookmark, and "
