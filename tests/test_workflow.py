@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from taskboard_agent.config import AppConfig
@@ -382,6 +383,82 @@ def test_run_once_processes_briefing_request_and_returns_for_review() -> None:
         ),
     ]
     assert result.comments[2].startswith("以下のようにブリーフィング要約を生成しました。")
+
+
+def test_run_once_logs_progress_with_trace_id(caplog) -> None:
+    redmine = FakeRedmine([{"id": 123}], _issue())
+
+    caplog.set_level(logging.INFO, logger="taskboard_agent.workflow")
+
+    run_once(
+        config=CONFIG,
+        redmine=redmine,
+        request_classifier=FakeClassifier(),
+        page_fetcher=FakePageFetcher(),
+        briefing_summarizer=FakeSummarizer(),
+        bookmark_client=FakeBookmarkClient(),
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Redmineの未完了チケットを検索します" in message for message in messages)
+    assert any("ページ本文を取得しました" in message for message in messages)
+    assert any(
+        "LinkAceへブックマークを登録しました" in message
+        and "bookmark_id=99" in message
+        and "bookmark_url=https://linkace.example.test/links/99" in message
+        for message in messages
+    )
+    assert any(record.trace_id == "issue#123" for record in caplog.records)
+
+
+def test_run_once_logs_caught_exception_with_stack_trace(caplog) -> None:
+    redmine = FakeRedmine([{"id": 123}], _issue())
+
+    caplog.set_level(logging.WARNING, logger="taskboard_agent.workflow")
+
+    run_once(
+        config=CONFIG,
+        redmine=redmine,
+        request_classifier=FakeClassifier(),
+        page_fetcher=FakePageFetcher(fail=True),
+        briefing_summarizer=FakeSummarizer(),
+        bookmark_client=FakeBookmarkClient(),
+    )
+
+    warning_records = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "ページ本文の取得に失敗しました" in record.getMessage()
+    ]
+    assert len(warning_records) == 1
+    assert warning_records[0].trace_id == "issue#123"
+    assert warning_records[0].exc_info is not None
+
+
+def test_run_once_logs_unsupported_request_as_warning(caplog) -> None:
+    redmine = FakeRedmine([{"id": 123}], _issue())
+    classifier = FakeClassifier(
+        RequestClassification(can_handle=False, url=None, reason="URLがありません")
+    )
+
+    caplog.set_level(logging.WARNING, logger="taskboard_agent.workflow")
+
+    run_once(
+        config=CONFIG,
+        redmine=redmine,
+        request_classifier=classifier,
+        page_fetcher=FakePageFetcher(),
+        briefing_summarizer=FakeSummarizer(),
+        bookmark_client=FakeBookmarkClient(),
+    )
+
+    assert any(
+        record.levelno == logging.WARNING
+        and record.trace_id == "issue#123"
+        and "処理対象外の依頼です" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_run_once_reports_updated_bookmark_when_linkace_updates_existing_link() -> None:

@@ -35,6 +35,15 @@ LINKACE_SUMMARIZED_LIST_ID=10
 
 LinkAce登録時、ブリーフィング要約を生成する前に同じURLのブックマークが既に存在するか確認します。既存ブックマークがリスト `id=1` に入っている場合は、新規作成ではなく既存ブックマークを更新してリスト `id=10` へ移します。既存ブックマークがリスト `id=1` に入っていない場合は、要約せずに「ブックマークが登録済みです。」とブックマークURLをRedmineへコメントし、担当者を起票者へ戻してレビュー中にします。
 
+ログ設定は実行ディレクトリの `logging.conf` を読み込みます。既定のログ形式は `{時刻} [{ログレベル}] {何らかのid} - {メッセージ}` です。
+
+```text
+2026-06-13 19:05:12 [INFO] run-once - Redmineの未完了チケットを検索します assigned_to_id=42 dry_run=False
+2026-06-13 19:05:13 [INFO] issue#123 - Redmineチケットを取得しました issue_id=123 author_id=7
+2026-06-13 19:05:20 [INFO] issue#123 - LinkAceへブックマークを登録しました bookmark_id=99 bookmark_url=https://linkace.example.test/links/99 action=created
+2026-06-13 19:05:21 [WARNING] issue#123 - ページ本文の取得に失敗しました target_url=https://example.test/article
+```
+
 ### 実行
 
 ```powershell
