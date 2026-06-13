@@ -4,7 +4,13 @@ import argparse
 import sys
 
 from taskboard_agent.config import ConfigError, load_config
-from taskboard_agent.llm import CommentGenerationError, OpenAIDescriptionGenerator
+from taskboard_agent.linkace import LinkAceClient, LinkAceError
+from taskboard_agent.llm import (
+    CommentGenerationError,
+    OpenAIBriefingSummarizer,
+    OpenAIRequestClassifier,
+)
+from taskboard_agent.page import PageFetchError, WebPageExtractor
 from taskboard_agent.redmine import RedmineClient, RedmineError
 from taskboard_agent.workflow import WorkflowError, run_once
 
@@ -21,8 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help=(
-            "Fetch the issue and generate the updated description/comment, "
-            "but do not update Redmine."
+            "Fetch the issue, page, and briefing, but do not update Redmine or LinkAce."
         ),
     )
 
@@ -39,17 +44,33 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config()
         redmine = RedmineClient(config.redmine_url, config.redmine_api_key)
-        description_generator = OpenAIDescriptionGenerator(
+        request_classifier = OpenAIRequestClassifier(
             api_key=config.openai_api_key,
             model=config.openai_model,
         )
+        page_fetcher = WebPageExtractor()
+        briefing_summarizer = OpenAIBriefingSummarizer(
+            api_key=config.openai_api_key,
+            model=config.openai_model,
+        )
+        bookmark_client = LinkAceClient(config.linkace_url, config.linkace_api_key)
         result = run_once(
             config=config,
             redmine=redmine,
-            description_generator=description_generator,
+            request_classifier=request_classifier,
+            page_fetcher=page_fetcher,
+            briefing_summarizer=briefing_summarizer,
+            bookmark_client=bookmark_client,
             dry_run=args.dry_run,
         )
-    except (ConfigError, CommentGenerationError, RedmineError, WorkflowError) as exc:
+    except (
+        ConfigError,
+        CommentGenerationError,
+        LinkAceError,
+        PageFetchError,
+        RedmineError,
+        WorkflowError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -59,21 +80,32 @@ def main(argv: list[str] | None = None) -> int:
 
     if result.dry_run:
         print(
-            f"Dry run complete for issue #{result.issue_id}; Redmine was not updated."
+            f"Dry run complete for issue #{result.issue_id}; Redmine and LinkAce were not updated."
         )
-        if result.description:
+        if result.target_url:
             print()
-            print("Generated description:")
-            print(result.description)
-        if result.comment:
+            print(f"Target URL: {result.target_url}")
+        if result.page_title:
+            print(f"Page title: {result.page_title}")
+        if result.briefing:
             print()
-            print("Generated comment:")
-            print(result.comment)
+            print("Generated briefing:")
+            print(result.briefing)
+        if result.bookmark_payload:
+            print()
+            print("LinkAce payload:")
+            print(result.bookmark_payload)
+        if result.comments:
+            print()
+            print("Comments that would be posted:")
+            for comment in result.comments:
+                print("---")
+                print(comment)
         return 0
 
     print(
         "Processed issue "
-        f"#{result.issue_id}; updated description, added action comment, and "
+        f"#{result.issue_id}; generated briefing, registered bookmark, and "
         f"reassigned to author #{result.reassigned_to_id}."
     )
     return 0

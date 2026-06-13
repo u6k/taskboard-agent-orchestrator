@@ -16,8 +16,13 @@ class AppConfig:
     redmine_url: str
     redmine_api_key: str
     redmine_ai_user_id: int
+    redmine_in_progress_status_id: int
+    redmine_review_status_id: int
     openai_api_key: str
     openai_model: str
+    linkace_url: str
+    linkace_api_key: str
+    linkace_summarized_list_id: int
 
 
 def load_config(env_file: str | Path = ".env") -> AppConfig:
@@ -26,15 +31,25 @@ def load_config(env_file: str | Path = ".env") -> AppConfig:
     redmine_url = _required("REDMINE_URL").rstrip("/")
     redmine_api_key = _required("REDMINE_API_KEY")
     redmine_ai_user_id = _required_int("REDMINE_AI_USER_ID")
+    redmine_in_progress_status_id = _optional_int("REDMINE_IN_PROGRESS_STATUS_ID", 2)
+    redmine_review_status_id = _optional_int("REDMINE_REVIEW_STATUS_ID", 10)
     openai_api_key = _required("OPENAI_API_KEY")
     openai_model = _required("OPENAI_MODEL")
+    linkace_url = _required("LINKACE_URL").rstrip("/")
+    linkace_api_key = _required("LINKACE_API_KEY")
+    linkace_summarized_list_id = _optional_int("LINKACE_SUMMARIZED_LIST_ID", 10)
 
     return AppConfig(
         redmine_url=redmine_url,
         redmine_api_key=redmine_api_key,
         redmine_ai_user_id=redmine_ai_user_id,
+        redmine_in_progress_status_id=redmine_in_progress_status_id,
+        redmine_review_status_id=redmine_review_status_id,
         openai_api_key=openai_api_key,
         openai_model=openai_model,
+        linkace_url=linkace_url,
+        linkace_api_key=linkace_api_key,
+        linkace_summarized_list_id=linkace_summarized_list_id,
     )
 
 
@@ -52,3 +67,12 @@ def _required_int(name: str) -> int:
     except ValueError as exc:
         raise ConfigError(f"{name} must be an integer") from exc
 
+
+def _optional_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(value.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
