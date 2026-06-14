@@ -13,8 +13,7 @@ ENV_KEYS = [
     "REDMINE_AI_USER_ID",
     "REDMINE_IN_PROGRESS_STATUS_ID",
     "REDMINE_REVIEW_STATUS_ID",
-    "OPENAI_API_KEY",
-    "OPENAI_MODEL",
+    "LLM_MODEL",
     "LINKACE_URL",
     "LINKACE_API_KEY",
     "LINKACE_SUMMARIZED_LIST_ID",
@@ -37,8 +36,7 @@ def test_load_config_reads_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
                 "REDMINE_AI_USER_ID=42",
                 "REDMINE_IN_PROGRESS_STATUS_ID=2",
                 "REDMINE_REVIEW_STATUS_ID=10",
-                "OPENAI_API_KEY=openai-key",
-                "OPENAI_MODEL=test-model",
+                "LLM_MODEL=test-model",
                 "LINKACE_URL=https://linkace.example.test/",
                 "LINKACE_API_KEY=linkace-key",
                 "LINKACE_SUMMARIZED_LIST_ID=10",
@@ -54,8 +52,7 @@ def test_load_config_reads_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert config.redmine_ai_user_id == 42
     assert config.redmine_in_progress_status_id == 2
     assert config.redmine_review_status_id == 10
-    assert config.openai_api_key == "openai-key"
-    assert config.openai_model == "test-model"
+    assert config.llm_model == "test-model"
     assert config.linkace_url == "https://linkace.example.test"
     assert config.linkace_api_key == "linkace-key"
     assert config.linkace_summarized_list_id == 10
@@ -72,8 +69,7 @@ def test_load_config_real_env_overrides_dotenv(
                 "REDMINE_URL=https://from-dotenv.example.test",
                 "REDMINE_API_KEY=redmine-key",
                 "REDMINE_AI_USER_ID=42",
-                "OPENAI_API_KEY=openai-key",
-                "OPENAI_MODEL=test-model",
+                "LLM_MODEL=test-model",
                 "LINKACE_URL=https://linkace.example.test",
                 "LINKACE_API_KEY=linkace-key",
             ]
@@ -98,8 +94,7 @@ def test_load_config_requires_integer_ai_user_id(
                 "REDMINE_URL=https://redmine.example.test",
                 "REDMINE_API_KEY=redmine-key",
                 "REDMINE_AI_USER_ID=not-an-int",
-                "OPENAI_API_KEY=openai-key",
-                "OPENAI_MODEL=test-model",
+                "LLM_MODEL=test-model",
                 "LINKACE_URL=https://linkace.example.test",
                 "LINKACE_API_KEY=linkace-key",
             ]
