@@ -3,17 +3,23 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 
+from taskboard_agent.agent import FunctionCallingAgent
 from taskboard_agent.config import ConfigError, load_config
 from taskboard_agent.linkace import LinkAceClient, LinkAceError
 from taskboard_agent.logging_config import configure_logging, log_trace
-from taskboard_agent.llm import (
-    CommentGenerationError,
-    OpenAIBriefingSummarizer,
-    OpenAIRequestClassifier,
-)
+from taskboard_agent.llm import LiteLLMClient
 from taskboard_agent.page import PageFetchError, WebPageExtractor
 from taskboard_agent.redmine import RedmineClient, RedmineError
+from taskboard_agent.skills import SkillRegistry, SkillRegistryError
+from taskboard_agent.task_executor import (
+    GenericTaskRunner,
+    LiteLLMTaskPlanner,
+    TaskOrchestrator,
+    TaskPlanningError,
+)
+from taskboard_agent.tool_loader import ToolRuntimeContext, ToolScriptCatalog
 from taskboard_agent.workflow import WorkflowError, run_once
 
 
@@ -32,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help=(
-            "Fetch the issue, page, and briefing, but do not update Redmine or LinkAce."
+            "Understand and execute the issue without updating Redmine or external services."
         ),
     )
 
@@ -52,31 +58,45 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config()
         redmine = RedmineClient(config.redmine_url, config.redmine_api_key)
-        request_classifier = OpenAIRequestClassifier(
-            api_key=config.openai_api_key,
-            model=config.openai_model,
-        )
+        llm = LiteLLMClient(model=config.llm_model)
         page_fetcher = WebPageExtractor()
-        briefing_summarizer = OpenAIBriefingSummarizer(
-            api_key=config.openai_api_key,
-            model=config.openai_model,
-        )
         bookmark_client = LinkAceClient(config.linkace_url, config.linkace_api_key)
+        skill_registry = SkillRegistry(Path("skills"))
+        skill_agent = FunctionCallingAgent(llm=llm)
+        tool_catalog = ToolScriptCatalog(
+            Path("tool_scripts"),
+            ToolRuntimeContext(
+                services={
+                    "llm": llm,
+                    "page_fetcher": page_fetcher,
+                    "bookmark_client": bookmark_client,
+                },
+                settings={
+                    "linkace_summarized_list_id": config.linkace_summarized_list_id,
+                },
+                dry_run=args.dry_run,
+            ),
+        )
+        task_executor = TaskOrchestrator(
+            planner=LiteLLMTaskPlanner(llm),
+            skill_registry=skill_registry,
+            tool_catalog=tool_catalog,
+            skill_agent=skill_agent,
+            generic_runner=GenericTaskRunner(llm),
+        )
         result = run_once(
             config=config,
             redmine=redmine,
-            request_classifier=request_classifier,
-            page_fetcher=page_fetcher,
-            briefing_summarizer=briefing_summarizer,
-            bookmark_client=bookmark_client,
+            task_executor=task_executor,
             dry_run=args.dry_run,
         )
     except (
         ConfigError,
-        CommentGenerationError,
         LinkAceError,
         PageFetchError,
         RedmineError,
+        SkillRegistryError,
+        TaskPlanningError,
         WorkflowError,
     ) as exc:
         with log_trace("run-once"):
@@ -94,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         with log_trace(f"issue#{result.issue_id}" if result.issue_id else "run-once"):
             logger.info("CLIを終了します status=%s dry_run=True", result.status)
         print(
-            f"Dry run complete for issue #{result.issue_id}; Redmine and LinkAce were not updated."
+            f"Dry run complete for issue #{result.issue_id}; external services were not updated."
         )
         if result.target_url:
             print()
@@ -107,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
             print(result.briefing)
         if result.bookmark_payload:
             print()
-            print("LinkAce payload:")
+            print("Tool payload:")
             print(result.bookmark_payload)
         if result.comments:
             print()
@@ -125,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     print(
         "Processed issue "
-        f"#{result.issue_id}; generated briefing, registered bookmark, and "
+        f"#{result.issue_id}; status={result.status}; "
         f"reassigned to author #{result.reassigned_to_id}."
     )
     return 0

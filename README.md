@@ -3,11 +3,13 @@
 
 ## Redmine Webページブリーフィング要約・ブックマーク登録 v1
 
-最初に実装するシナリオは、RedmineでAIユーザーが担当している「https://xxx をブリーフィング要約してブックマークに登録して。」のようなチケットを1件取得し、Webページ本文をブリーフィング要約してブックマークに登録する one-shot CLI です。
+RedmineでAIユーザーが担当しているチケットを1件取得し、チケットDescriptionから作業内容を理解して、必要なスキルを選択したうえで実行する one-shot CLI です。初期スキルとして「https://xxx をブリーフィング要約してブックマークに登録して。」のようなWebページ本文要約・ブックマーク登録に対応しています。
 
-AIエージェントは、チケットを読み取ったら作業目的、成果物、作業計画、完了条件を整理してチケット詳細に記録します。その後、作業計画を1ステップずつ実行し、各ステップの完了ごとに計画へチェックを付け、コメントと成果物をチケットに残します。全ステップが完了したら、ステータスをレビュー中に更新し、担当者をチケット起票者へ戻します。
+AIエージェントは、チケットを読み取ったら依頼内容の理解、判断理由、実行方法、作業開始を1つのコメントにまとめて残します。その後、スキルまたはtoolの実行完了、作業完了報告またはユーザー確認事項をコメントし、完了時や確認待ち時はステータスをレビュー中に更新して担当者をチケット起票者へ戻します。
 
-Webページ取得、本文抽出、ブックマーク登録はツールとして用意し、ブリーフィング要約はスキル内に記載されたプロンプトを使います。
+AIエージェントは利用可能なスキル一覧とtool一覧を見て実行方法を決めます。toolを1つまたは複数使えば依頼内容を過不足なく実行できる場合は、スキルを使わずtoolだけで実行します。依頼目的全体がスキルの目的と一致し、toolを個別に組み合わせるよりスキル手順に従う方が適切な場合だけスキルを使います。該当スキルやtoolがない場合は、外部ツールなしで完了できる作業だけを実行し、依頼内容が不明確または必要なスキル・ツールが不足している場合は、ユーザーに求める追記内容をコメントしてレビュー中に戻します。
+
+ツールは `tool_scripts/{tool_name}.py` として定義します。各スクリプトは `TOOL_SPEC` と `create_handler(context)` を公開し、スキルの `required_tools` に書かれた tool 名から実行時に読み込まれます。ワークフローやCLIは個別スキル名ではなく、選択されたスキルの `required_tools` に従って tool registry を構成します。
 
 ### セットアップ
 
@@ -24,12 +26,13 @@ REDMINE_API_KEY=replace-with-redmine-api-key
 REDMINE_AI_USER_ID=123
 REDMINE_IN_PROGRESS_STATUS_ID=2
 REDMINE_REVIEW_STATUS_ID=10
-OPENAI_API_KEY=replace-with-openai-api-key
-OPENAI_MODEL=replace-with-openai-model
+LLM_MODEL=replace-with-litellm-model
 LINKACE_URL=https://linkace.example.com
 LINKACE_API_KEY=replace-with-linkace-api-key
 LINKACE_SUMMARIZED_LIST_ID=10
 ```
+
+言語モデルの呼び出しはLiteLLM経由で行います。`LLM_MODEL` には `openai/gpt-4.1-mini`、`anthropic/claude-...`、`gemini/...`、`ollama/...` などLiteLLMが扱うモデル名を指定し、APIキーは各プロバイダが要求する環境変数に設定してください。
 
 `LINKACE_API_KEY` には、LinkAceのユーザー設定またはシステム設定で作成したAPIトークンの実体を設定します。トークン名や作成後の一覧に表示される識別情報ではなく、作成直後に表示されるトークン文字列を保存してください。LinkAce API が 401 を返す場合は、トークンの値、失効有無、API権限を確認してください。
 
@@ -50,7 +53,7 @@ LinkAce登録時、ブリーフィング要約を生成する前に同じURLの�
 uv run taskboard-agent run-once
 ```
 
-RedmineとLinkAceを更新せずに、AI判定、ページ本文抽出、ブリーフィング要約だけ確認する場合:
+Redmineや外部サービスを更新せずに、依頼理解、スキル選択、ツール実行結果だけ確認する場合:
 
 ```powershell
 uv run taskboard-agent run-once --dry-run

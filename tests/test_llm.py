@@ -1,61 +1,13 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from taskboard_agent.llm import (
-    BRIEFING_PROMPT,
-    CommentGenerationError,
-    build_briefing_prompt,
+    LiteLLMClient,
     build_issue_prompt,
-    build_request_classification_prompt,
-    parse_request_classification,
 )
-
-
-def test_build_request_classification_prompt_requires_json_and_includes_issue() -> None:
-    prompt = build_request_classification_prompt(
-        {
-            "subject": "記事を要約する",
-            "description": "https://example.test/article をブリーフィング要約してほしい",
-        }
-    )
-
-    assert "JSON" in prompt
-    assert "can_handle" in prompt
-    assert "url" in prompt
-    assert "reason" in prompt
-    assert "記事を要約する" in prompt
-    assert "https://example.test/article" in prompt
-
-
-def test_parse_request_classification_reads_valid_json() -> None:
-    classification = parse_request_classification(
-        '{"can_handle": true, "url": "https://example.test/article", "reason": "対象"}'
-    )
-
-    assert classification.can_handle is True
-    assert classification.url == "https://example.test/article"
-    assert classification.reason == "対象"
-
-
-def test_parse_request_classification_rejects_true_without_url() -> None:
-    with pytest.raises(CommentGenerationError, match="without url"):
-        parse_request_classification(
-            '{"can_handle": true, "url": null, "reason": "URLなし"}'
-        )
-
-
-def test_build_briefing_prompt_uses_specified_prompt_and_article_text() -> None:
-    prompt = build_briefing_prompt(
-        url="https://example.test/article",
-        title="Article title",
-        text="本文です",
-    )
-
-    assert BRIEFING_PROMPT in prompt
-    assert "https://example.test/article" in prompt
-    assert "Article title" in prompt
-    assert "本文です" in prompt
 
 
 def test_build_issue_prompt_requires_updated_description_format() -> None:
@@ -75,3 +27,75 @@ def test_build_issue_prompt_requires_updated_description_format() -> None:
     assert "# ユーザーが記載した元文章" in prompt
     assert "ユーザーが記載した元Description:" in prompt
     assert "元の依頼文です。" in prompt
+
+
+def test_litellm_client_reads_text_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_completion(**kwargs: object) -> dict[str, object]:
+        assert kwargs["model"] == "test-model"
+        assert kwargs["messages"] == [{"role": "user", "content": "hello"}]
+        return {"choices": [{"message": {"content": "こんにちは"}}]}
+
+    monkeypatch.setattr("taskboard_agent.llm.litellm.completion", fake_completion)
+
+    response = LiteLLMClient("test-model").complete(
+        [{"role": "user", "content": "hello"}]
+    )
+
+    assert response.content == "こんにちは"
+    assert response.tool_calls == ()
+
+
+def test_litellm_client_logs_prompt_and_response(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fake_completion(**kwargs: object) -> dict[str, object]:
+        return {"choices": [{"message": {"content": "こんにちは"}}]}
+
+    monkeypatch.setattr("taskboard_agent.llm.litellm.completion", fake_completion)
+    caplog.set_level(logging.DEBUG, logger="taskboard_agent.llm")
+
+    LiteLLMClient("test-model").complete(
+        [{"role": "user", "content": "hello"}]
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("LLM入力プロンプト" in message and "hello" in message for message in messages)
+    assert any("LLM出力内容" in message and "こんにちは" in message for message in messages)
+
+
+def test_litellm_client_reads_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_completion(**kwargs: object) -> dict[str, object]:
+        assert kwargs["tools"] == [{"type": "function", "function": {"name": "echo"}}]
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": '{"text": "hello"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("taskboard_agent.llm.litellm.completion", fake_completion)
+
+    response = LiteLLMClient("test-model").complete(
+        [{"role": "user", "content": "hello"}],
+        tools=[{"type": "function", "function": {"name": "echo"}}],
+    )
+
+    assert response.content == ""
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].id == "call-1"
+    assert response.tool_calls[0].name == "echo"
+    assert response.tool_calls[0].arguments == '{"text": "hello"}'
