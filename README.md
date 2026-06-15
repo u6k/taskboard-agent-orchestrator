@@ -32,7 +32,7 @@ LINKACE_API_KEY=replace-with-linkace-api-key
 LINKACE_SUMMARIZED_LIST_ID=10
 ```
 
-言語モデルの呼び出しはLiteLLM経由で行います。`LLM_MODEL` には `openai/gpt-4.1-mini`、`anthropic/claude-...`、`gemini/...`、`ollama/...` などLiteLLMが扱うモデル名を指定し、APIキーは各プロバイダが要求する環境変数に設定してください。
+言語モデルの呼び出しはLiteLLM経由で行います。`LLM_MODEL` には `openai/gpt-4.1-mini`、`anthropic/claude-...`、`gemini/...`、`ollama/...`、`lm_studio/...` などLiteLLMが扱うモデル名を指定し、APIキーやAPI Base URLは各プロバイダが要求する環境変数に設定してください。
 
 OpenAIのモデルを使う場合の例:
 
@@ -45,12 +45,13 @@ OPENAI_API_KEY=replace-with-openai-api-key
 LM StudioをOpenAI互換APIとして使う場合の例:
 
 ```dotenv
-LLM_MODEL=openai/replace-with-lm-studio-model-id
-OPENAI_API_KEY=lm-studio
-OPENAI_BASE_URL=http://localhost:1234/v1
+LLM_MODEL=lm_studio/replace-with-lm-studio-model-id
+LM_STUDIO_API_BASE=http://localhost:1234/v1
+# LM_STUDIO_API_KEY は任意。LM Studio側でAPIキーを設定している場合だけ指定する。
+# LM_STUDIO_API_KEY=replace-with-lm-studio-api-key
 ```
 
-LM Studio側でモデルをロードし、Local Serverを起動してから実行してください。`LLM_MODEL` の `openai/` 以降には、LM StudioのLocal Server画面や `/v1/models` で確認できるモデルIDを指定します。LM Studioはローカル利用では実質的にAPIキーを使いませんが、LiteLLM/OpenAI互換クライアント側がAPIキーを要求するため、`OPENAI_API_KEY` には `lm-studio` など任意の非空文字列を設定します。
+LM Studio側でモデルをロードし、Local Serverを起動してから実行してください。`LLM_MODEL` の `lm_studio/` 以降には、LM StudioのLocal Server画面や `/v1/models` で確認できるモデルIDを指定します。LiteLLMのLM Studio provider routeは `lm_studio/` です。`OPENAI_API_KEY` と `OPENAI_BASE_URL` はOpenAI provider用の設定なので、LM Studioへ切り替える場合は使わないでください。
 
 `LINKACE_API_KEY` には、LinkAceのユーザー設定またはシステム設定で作成したAPIトークンの実体を設定します。トークン名や作成後の一覧に表示される識別情報ではなく、作成直後に表示されるトークン文字列を保存してください。LinkAce API が 401 を返す場合は、トークンの値、失効有無、API権限を確認してください。
 
