@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal, Protocol
 
 from taskboard_agent.llm import LLMResponse
@@ -16,6 +16,11 @@ from taskboard_agent.skill_runtime import (
     llm_response_events,
 )
 from taskboard_agent.skills import Skill, SkillRegistry
+from taskboard_agent.structured_output import (
+    generic_execution_response_format,
+    task_plan_response_format,
+    tool_execution_response_format,
+)
 from taskboard_agent.tools import ToolRegistry, ToolRegistryError
 
 
@@ -36,6 +41,7 @@ class TaskLLMPort(Protocol):
         *,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = "auto",
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
         ...
 
@@ -78,7 +84,7 @@ class LiteLLMTaskPlanner:
                     "スキルは依頼目的全体がスキルの目的と一致する場合だけ使ってください。"
                     "依頼が曖昧、必要情報が不足、または必要なtool/skillが不足している場合はneeds_userにしてください。"
                     "既存スキルなしで言語モデルだけで完了できる作業はno_skillにしてください。"
-                    "出力は有効なJSON objectだけにしてください。"
+                    "計画の出力構造はAPI側で指定されています。"
                 ),
             },
             {
@@ -87,8 +93,19 @@ class LiteLLMTaskPlanner:
             },
         ]
         last_error: TaskPlanningError | None = None
+        response_format = task_plan_response_format(
+            skill_names=(skill.name for skill in skills),
+            tool_names=(
+                name
+                for tool in tools
+                if isinstance((name := tool.get("name")), str)
+            ),
+        )
         for attempt in range(MAX_TASK_PLAN_ATTEMPTS):
-            response = self._llm.complete(messages)
+            response = self._llm.complete(
+                messages,
+                response_format=response_format,
+            )
             try:
                 plan = parse_task_plan(response.content)
                 _validate_task_plan(plan, skills=skills, tools=tools)
@@ -127,9 +144,28 @@ class GenericTaskRunner:
         issue: dict[str, Any],
         dry_run: bool = False,
         emit_event: SkillEventSink | None = None,
+        conversation_messages: list[dict[str, Any]] | None = None,
+        task_plan: TaskPlan | None = None,
     ) -> SkillExecutionResult:
-        response = self._llm.complete(
-            [
+        if conversation_messages:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "あなたはRedmineチケットを継続して処理するAIです。"
+                        "以下の会話履歴全体と直前の再計画に従い、外部toolや専用skillなしで作業してください。"
+                        "過去の成果を推測せず、会話履歴に記録された事実を使ってください。"
+                        "最終応答はRedmineへ投稿する自然なMarkdown本文にしてください。"
+                    ),
+                },
+                *conversation_messages,
+                {
+                    "role": "user",
+                    "content": _build_conversation_generic_prompt(task_plan),
+                },
+            ]
+        else:
+            messages = [
                 {
                     "role": "system",
                     "content": (
@@ -137,12 +173,26 @@ class GenericTaskRunner:
                         "利用可能な外部toolや専用skillはありません。"
                         "チケット本文だけで完了できる作業だけを実行してください。"
                         "外部システム操作、Web取得、ファイル更新、追加情報が必要な場合は完了したふりをせず、"
-                        "ユーザーに求めることを返してください。出力はJSONのみです。"
+                        "ユーザーに求めることを返してください。出力構造はAPI側で指定されています。"
                     ),
                 },
                 {"role": "user", "content": _build_generic_prompt(issue)},
             ]
+        response = self._llm.complete(
+            messages,
+            response_format=(
+                None if conversation_messages else generic_execution_response_format()
+            ),
         )
+        if conversation_messages:
+            notes = response.content.strip()
+            if not notes:
+                raise TaskPlanningError("conversation execution result was empty")
+            return SkillExecutionResult(
+                status="dry_run" if dry_run else "processed",
+                events=(SkillEvent("final_review", notes),),
+                dry_run=dry_run,
+            )
         return _parse_generic_execution(response.content, dry_run=dry_run)
 
 
@@ -180,6 +230,7 @@ class GenericToolsRunner:
             tools=tools,
             allow_writes=not dry_run,
             on_llm_response=record_llm_response,
+            response_format=tool_execution_response_format(),
         )
         result = _parse_tool_execution(
             agent_result.final_text,
@@ -215,23 +266,55 @@ class TaskOrchestrator:
         dry_run: bool = False,
         emit_event: SkillEventSink | None = None,
     ) -> SkillExecutionResult:
+        plan = self.create_plan(issue)
+        return self.execute_plan(
+            issue=issue,
+            plan=plan,
+            dry_run=dry_run,
+            emit_event=emit_event,
+        )
+
+    def create_plan(self, issue: dict[str, Any]) -> TaskPlan:
+        return self._planner.plan(
+            issue,
+            self._skill_registry.list(),
+            self._tool_catalog.summaries(),
+        )
+
+    def planning_catalog(self) -> tuple[list[Skill], list[dict[str, Any]]]:
+        return self._skill_registry.list(), self._tool_catalog.summaries()
+
+    def execute_plan(
+        self,
+        *,
+        issue: dict[str, Any],
+        plan: TaskPlan,
+        dry_run: bool = False,
+        emit_event: SkillEventSink | None = None,
+        announce_plan: bool = True,
+        conversation_messages: list[dict[str, Any]] | None = None,
+    ) -> SkillExecutionResult:
         skills = self._skill_registry.list()
-        tool_summaries = self._tool_catalog.summaries()
-        plan = self._planner.plan(issue, skills, tool_summaries)
+        execution_issue = dict(issue)
+        if conversation_messages:
+            execution_issue["conversation_context"] = conversation_messages
         if plan.decision == "needs_user":
             return _needs_user_result(plan.user_request or plan.reason)
         if plan.decision == "no_skill":
-            if emit_event is not None:
+            if emit_event is not None and announce_plan:
                 emit_event(_plan_start_event(plan))
-                return self._generic_runner.run(
-                    issue=issue,
-                    dry_run=dry_run,
-                    emit_event=emit_event,
-                )
-            return _prepend_plan_event(
-                self._generic_runner.run(issue=issue, dry_run=dry_run),
-                _plan_notes(plan),
+            result = self._generic_runner.run(
+                issue=execution_issue,
+                dry_run=dry_run,
+                emit_event=emit_event,
+                conversation_messages=conversation_messages,
+                task_plan=plan,
             )
+            if emit_event is not None:
+                return result
+            if not announce_plan:
+                return _drop_start_event(result)
+            return _prepend_plan_event(result, _plan_notes(plan))
         if plan.decision == "use_tools":
             if not plan.tool_names:
                 return _needs_user_result("利用するtoolを特定できませんでした。作業内容を具体的に追記してください。")
@@ -244,10 +327,10 @@ class TaskOrchestrator:
             task_input = dict(plan.task_input or {})
             if plan.target_url:
                 task_input.setdefault("target_url", plan.target_url.strip())
-            if emit_event is not None:
+            if emit_event is not None and announce_plan:
                 emit_event(_plan_start_event(plan))
             result = self._tools_runner.run(
-                issue=issue,
+                issue=execution_issue,
                 tools=tool_registry,
                 tool_names=plan.tool_names,
                 task_input=task_input,
@@ -255,6 +338,8 @@ class TaskOrchestrator:
                 emit_event=emit_event,
             )
             if emit_event is not None:
+                return _drop_start_event(result)
+            if not announce_plan:
                 return _drop_start_event(result)
             return _prepend_plan_event(result, _plan_notes(plan))
 
@@ -283,15 +368,17 @@ class TaskOrchestrator:
         task_input = dict(plan.task_input or {})
         if plan.target_url:
             task_input.setdefault("target_url", plan.target_url.strip())
-        if emit_event is not None:
+        if emit_event is not None and announce_plan:
             emit_event(_plan_start_event(plan))
         result = runner.run(
-            issue=issue,
+            issue=execution_issue,
             task_input=task_input,
             dry_run=dry_run,
             emit_event=emit_event,
         )
         if emit_event is not None:
+            return _drop_start_event(result)
+        if not announce_plan:
             return _drop_start_event(result)
         return _prepend_plan_event(result, _plan_notes(plan))
 
@@ -384,8 +471,7 @@ def _build_plan_retry_prompt(error: TaskPlanningError) -> str:
         "前回の出力は次の検証エラーにより無効です。\n"
         f"- {error}\n\n"
         "作業内容の判断は変えず、型と分岐の整合性だけを修正してください。\n"
-        "文字列の \"null\" ではなくJSON値の null を使用してください。\n"
-        "Markdownやコードフェンスを付けず、有効なJSON objectだけを返してください。"
+        "APIで指定された出力構造と分岐条件に従って再回答してください。"
     )
 
 
@@ -537,25 +623,13 @@ def _build_planning_prompt(
         "toolを1つまたは複数使えば依頼内容を過不足なく実行できる場合はuse_toolsを選んでください。\n"
         "toolを複数使うよりskillを使う方が依頼目的に近い場合だけuse_skillを選んでください。\n"
         "依頼されていない作業を含むスキルは選ばないでください。例えば「Webページ本文を取得して」だけなら、ブックマーク登録まで行うスキルは使わずfetch_web_pageだけを使ってください。\n"
-        "型規則:\n"
-        "- nullには引用符を付けず、JSON値のnullとして出力する。\n"
-        "- task_inputはJSON objectまたはnull。文字列は禁止。\n"
-        "- user_request、skill_name、target_urlは文字列またはnull。\n"
+        "分岐規則:\n"
         "- use_skillではskill_nameを指定し、tool_namesは必ず[]にする。\n"
         "- use_toolsではskill_nameをnullにし、tool_namesを1件以上指定する。\n"
         "- no_skillではskill_nameをnull、tool_namesを[]にする。\n"
         "- needs_userではskill_nameをnull、tool_namesを[]にし、user_requestを指定する。\n"
-        "- Markdownやコードフェンスを付けず、JSON objectだけを出力する。\n\n"
-        "use_skillの有効な出力例:\n"
-        "{\n"
-        '  "decision": "use_skill",\n'
-        '  "skill_name": "web-briefing-bookmark",\n'
-        '  "tool_names": [],\n'
-        '  "target_url": "https://example.com/article",\n'
-        '  "task_input": null,\n'
-        '  "reason": "依頼目的がスキルと一致するため",\n'
-        '  "user_request": null\n'
-        "}\n\n"
+        "task_inputは補足指示が必要な場合だけinstructionとtarget_urlを設定してください。\n"
+        "出力構造と型はAPI側で指定されています。\n\n"
         f"利用可能なスキル:\n{json.dumps(skill_summaries, ensure_ascii=False)}\n\n"
         f"利用可能なtool:\n{json.dumps(tools, ensure_ascii=False)}\n\n"
         f"チケット:\n{json.dumps(_issue_context(issue), ensure_ascii=False)}"
@@ -577,25 +651,17 @@ def _build_tool_messages(
                 "指定されたfunction toolsだけを使い、依頼された範囲を過不足なく実行してください。"
                 "依頼されていない追加作業は行わないでください。"
                 "tool結果のok=falseは失敗として扱い、必要なら追加作業を止めてユーザー確認を求めてください。"
-                "最終応答はJSONだけにしてください。"
+                "最終的な作業状態とRedmine向け報告を返してください。出力構造はAPI側で指定されています。"
             ),
         },
         {
             "role": "user",
             "content": (
                 f"使用するtool: {', '.join(tool_names)}\n\n"
-                "実行コンテキストJSON:\n"
+                "実行コンテキスト:\n"
                 f"{json.dumps({'issue': issue, 'task_input': task_input, 'dry_run': dry_run}, ensure_ascii=False)}\n\n"
-                "最終応答JSON形式:\n"
-                "{"
-                '"status": "processed|needs_user|missing_tool|failed", '
-                '"notes": "Redmineに投稿する自然な日本語の作業報告またはユーザーに求めること。実行した内容、確認したこと、成果物、未処理事項を含める。JSON文字列や内部statusの説明は書かない", '
-                '"target_url": "任意", '
-                '"page_title": "任意", '
-                '"briefing": "任意", '
-                '"bookmark_url": "任意", '
-                '"bookmark_payload": "任意のobjectまたはnull"'
-                "}"
+                "notesにはRedmineへ投稿する自然な日本語の作業報告またはユーザーに求めることを記載し、"
+                "実行内容、確認内容、成果物、未処理事項を含めてください。"
             ),
         },
     ]
@@ -604,12 +670,18 @@ def _build_tool_messages(
 def _build_generic_prompt(issue: dict[str, Any]) -> str:
     return (
         "次のチケットを、外部toolや専用skillなしで実行できる範囲で処理してください。\n"
-        "必ず次のJSONだけを返してください。\n"
-        "{"
-        '"status": "completed|needs_user|missing_tool", '
-        '"notes": "Redmineに投稿する自然な日本語の作業報告またはユーザーに求めること。実行した内容、判断したこと、未処理事項を含める。JSON文字列や内部statusの説明は書かない"'
-        "}\n\n"
+        "notesにはRedmineへ投稿する自然な日本語の作業報告またはユーザーに求めることを記載し、"
+        "実行内容、判断内容、未処理事項を含めてください。出力構造はAPI側で指定されています。\n\n"
         f"チケット:\n{json.dumps(_issue_context(issue), ensure_ascii=False)}"
+    )
+
+
+def _build_conversation_generic_prompt(plan: TaskPlan | None) -> str:
+    return (
+        "直前に作成した再計画を、これまでの会話コンテキストを使って実行してください。\n"
+        f"再計画データ:\n{json.dumps(asdict(plan) if plan else None, ensure_ascii=False)}\n\n"
+        "Redmineへ投稿する実行結果または回答の本文だけを返してください。\n"
+        "会話に記録された事実と成果物を使用し、JSON、コードフェンス、前置きは付けないでください。"
     )
 
 

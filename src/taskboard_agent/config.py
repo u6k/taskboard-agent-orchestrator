@@ -22,6 +22,9 @@ class AppConfig:
     linkace_url: str
     linkace_api_key: str
     linkace_summarized_list_id: int
+    langgraph_checkpoint_db_path: Path = Path(
+        ".taskboard-agent/checkpoints.sqlite3"
+    )
 
 
 def load_config(env_file: str | Path = ".env") -> AppConfig:
@@ -36,6 +39,12 @@ def load_config(env_file: str | Path = ".env") -> AppConfig:
     linkace_url = _required("LINKACE_URL").rstrip("/")
     linkace_api_key = _required("LINKACE_API_KEY")
     linkace_summarized_list_id = _optional_int("LINKACE_SUMMARIZED_LIST_ID", 10)
+    langgraph_checkpoint_db_path = Path(
+        os.getenv(
+            "LANGGRAPH_CHECKPOINT_DB_PATH",
+            ".taskboard-agent/checkpoints.sqlite3",
+        ).strip()
+    )
 
     return AppConfig(
         redmine_url=redmine_url,
@@ -47,6 +56,7 @@ def load_config(env_file: str | Path = ".env") -> AppConfig:
         linkace_url=linkace_url,
         linkace_api_key=linkace_api_key,
         linkace_summarized_list_id=linkace_summarized_list_id,
+        langgraph_checkpoint_db_path=langgraph_checkpoint_db_path,
     )
 
 

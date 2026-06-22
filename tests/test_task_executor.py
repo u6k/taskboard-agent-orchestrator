@@ -24,6 +24,7 @@ class FakeLLM:
     def __init__(self, responses: list[str]) -> None:
         self.responses = responses
         self.messages: list[list[dict[str, Any]]] = []
+        self.response_formats: list[dict[str, Any] | None] = []
 
     def complete(
         self,
@@ -31,8 +32,10 @@ class FakeLLM:
         *,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = "auto",
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
         self.messages.append(messages)
+        self.response_formats.append(response_format)
         return LLMResponse(content=self.responses.pop(0))
 
 
@@ -87,9 +90,15 @@ class FakeSkillAgent:
         allow_writes: bool = False,
         approved_tools: set[str] | None = None,
         on_llm_response: Any | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> AgentRunResult:
         self.calls.append(
-            {"messages": messages, "tools": tools, "allow_writes": allow_writes}
+            {
+                "messages": messages,
+                "tools": tools,
+                "allow_writes": allow_writes,
+                "response_format": response_format,
+            }
         )
         if on_llm_response is not None:
             on_llm_response(
@@ -219,7 +228,7 @@ def test_task_planner_retries_with_validation_error_and_accepts_correction() -> 
     assert plan.decision == "use_skill"
     assert len(llm.messages) == 2
     assert "tool_names to be an empty array" in llm.messages[1][-1]["content"]
-    assert '文字列の "null"' in llm.messages[1][-1]["content"]
+    assert "APIで指定された出力構造" in llm.messages[1][-1]["content"]
 
 
 def test_task_planner_fails_after_two_correction_retries() -> None:
@@ -258,8 +267,12 @@ def test_task_planner_includes_available_skills_in_prompt() -> None:
     assert plan.skill_name == "web-briefing-bookmark"
     assert "web-briefing-bookmark" in llm.messages[0][1]["content"]
     assert "fetch_web_page" in llm.messages[0][1]["content"]
-    assert '"task_input": null' in llm.messages[0][1]["content"]
-    assert "文字列は禁止" in llm.messages[0][1]["content"]
+    response_format = llm.response_formats[0]
+    assert response_format is not None
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    assert "task_input" in response_format["json_schema"]["schema"]["properties"]
+    assert "JSON objectだけ" not in llm.messages[0][1]["content"]
 
 
 def test_task_planner_can_choose_direct_tools_for_narrow_request() -> None:
@@ -310,6 +323,8 @@ def test_orchestrator_runs_selected_skill() -> None:
     ).run(issue=_issue())
 
     assert result.status == "processed"
+    assert skill_agent.calls[0]["response_format"]["type"] == "json_schema"
+    assert skill_agent.calls[0]["response_format"]["json_schema"]["strict"] is True
     assert tool_catalog.calls[0]["tool_names"] == ("fetch_web_page",)
     assert '"target_url": "https://example.test/article"' in skill_agent.calls[0]["messages"][1]["content"]
     assert result.events[0].kind == "start"
@@ -341,6 +356,7 @@ def test_orchestrator_runs_selected_tools_without_skill() -> None:
     ).run(issue=_issue())
 
     assert result.status == "processed"
+    assert skill_agent.calls[0]["response_format"]["type"] == "json_schema"
     assert tool_catalog.calls[0]["tool_names"] == ("fetch_web_page",)
     assert "使用するtool: fetch_web_page" in skill_agent.calls[0]["messages"][1]["content"]
     assert result.events[0].kind == "start"
@@ -395,6 +411,40 @@ def test_orchestrator_runs_no_skill_fallback() -> None:
     assert "作業を開始します。" in result.events[0].notes
     assert result.events[1].kind == "final_review"
     assert result.events[1].notes == "文面を整理しました。"
+
+
+def test_generic_runner_executes_revision_with_full_conversation() -> None:
+    llm = FakeLLM(
+        [
+            "## 作業報告\n\n"
+            "1. Webページを取得しました。\n"
+            "2. ブリーフィング要約を作成しました。\n"
+            "3. LinkAceへ登録しました。"
+        ]
+    )
+    runner = GenericTaskRunner(llm)
+
+    result = runner.run(
+        issue=_issue(),
+        conversation_messages=[
+            {"role": "assistant", "content": "ブリーフィング要約を作成しました。"},
+            {"role": "assistant", "content": "ブックマークURL: https://bookmark.test/1"},
+            {"role": "user", "content": "差し戻しです。作業を説明してください。"},
+        ],
+        task_plan=TaskPlan(
+            decision="no_skill",
+            reason="会話履歴だけで説明できる",
+        ),
+    )
+
+    assert result.status == "processed"
+    sent = llm.messages[0]
+    assert any("ブリーフィング要約を作成" in message["content"] for message in sent)
+    assert any("https://bookmark.test/1" in message["content"] for message in sent)
+    assert "直前に作成した再計画" in sent[-1]["content"]
+    assert "JSON、コードフェンス" in sent[-1]["content"]
+    assert result.events[0].notes is not None
+    assert result.events[0].notes.startswith("## 作業報告")
 
 
 def test_orchestrator_returns_needs_user_for_unclear_request() -> None:

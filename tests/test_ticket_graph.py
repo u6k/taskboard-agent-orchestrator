@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+from taskboard_agent.llm import LLMResponse
+from taskboard_agent.skill_runtime import SkillEvent, SkillExecutionResult
+from taskboard_agent.task_executor import TaskPlan
+from taskboard_agent.ticket_graph import TicketConversationGraph
+
+
+class FakeLLM:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = responses
+        self.calls: list[list[dict[str, Any]]] = []
+
+    def complete(self, messages: list[dict[str, Any]], **_kwargs: Any) -> LLMResponse:
+        self.calls.append(messages)
+        return LLMResponse(content=self.responses.pop(0))
+
+
+class FakeOrchestrator:
+    def __init__(self, *, fail_revision_once: bool = False) -> None:
+        self.executions: list[dict[str, Any]] = []
+        self.fail_revision_once = fail_revision_once
+
+    def create_plan(self, issue: dict[str, Any]) -> TaskPlan:
+        return TaskPlan(decision="no_skill", reason="チケット本文だけで対応可能")
+
+    def planning_catalog(self) -> tuple[list[Any], list[dict[str, Any]]]:
+        return [], []
+
+    def execute_plan(
+        self,
+        *,
+        issue: dict[str, Any],
+        plan: TaskPlan,
+        dry_run: bool = False,
+        emit_event: Any = None,
+        announce_plan: bool = True,
+        conversation_messages: list[dict[str, Any]] | None = None,
+    ) -> SkillExecutionResult:
+        self.executions.append(
+            {
+                "issue": issue,
+                "plan": plan,
+                "dry_run": dry_run,
+                "announce_plan": announce_plan,
+                "conversation_messages": conversation_messages,
+            }
+        )
+        if announce_plan and emit_event is not None:
+            emit_event(SkillEvent("start", "初回作業を計画しました。"))
+        if not announce_plan and self.fail_revision_once:
+            self.fail_revision_once = False
+            raise RuntimeError("revision execution failed")
+        return SkillExecutionResult(
+            status="processed",
+            events=(SkillEvent("final_review", "作業結果を確認してください。"),),
+            target_url="https://example.test/article",
+            page_title="Article",
+            briefing="保存済みの要約本文",
+            bookmark_url="https://bookmark.test/links/1",
+        )
+
+
+def _issue(*, journals: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return {
+        "id": 123,
+        "subject": "文章を作成する",
+        "description": "案内文を作成してください。",
+        "author": {"id": 7},
+        "journals": journals or [],
+    }
+
+
+def _revision_response() -> str:
+    return (
+        '{"previous_work_summary":"案内文を作成した",'
+        '"feedback_summary":"文章が長い",'
+        '"requested_changes":[["短くする"]],'
+        '"keep_existing_results":["案内文の主旨"],'
+        '"work_to_redo":["案内文を短く修正する"],'
+        '"task_plan":{"decision":"no_skill","reason":"文章の修正だけで完了する",'
+        '"skill_name":null,"tool_names":[],"target_url":null,'
+        '"task_input":"案内文を短くする","user_request":null}}'
+    )
+
+
+def test_initial_run_creates_ticket_conversation_and_interrupts() -> None:
+    graph = TicketConversationGraph(
+        task_orchestrator=FakeOrchestrator(),  # type: ignore[arg-type]
+        llm=FakeLLM([]),
+        checkpointer=InMemorySaver(),
+        ai_user_id=42,
+    )
+    events: list[SkillEvent] = []
+
+    result = graph.run(issue=_issue(), emit_event=events.append)
+
+    assert result.status == "processed"
+    assert [event.notes for event in events] == [
+        "初回作業を計画しました。",
+        "作業結果を確認してください。",
+        "作業が終了しました。",
+    ]
+    assert [event.kind for event in events] == ["start", "progress", "final_review"]
+    state = graph.conversation_state(123)
+    assert isinstance(state["messages"][0], HumanMessage)
+    assert "案内文を作成してください" in state["messages"][0].content
+    assert isinstance(state["messages"][-1], AIMessage)
+
+
+def test_resume_adds_only_new_human_comment_and_publishes_revision_first() -> None:
+    llm = FakeLLM([_revision_response()])
+    orchestrator = FakeOrchestrator()
+    graph = TicketConversationGraph(
+        task_orchestrator=orchestrator,  # type: ignore[arg-type]
+        llm=llm,
+        checkpointer=InMemorySaver(),
+        ai_user_id=42,
+    )
+    graph.run(issue=_issue())
+    events: list[SkillEvent] = []
+    resumed_issue = _issue(
+        journals=[
+            {"id": 1, "user": {"id": 42}, "notes": "作業結果を確認してください。"},
+            {"id": 2, "user": {"id": 7}, "notes": "文章が長いので短くしてください。"},
+        ]
+    )
+
+    result = graph.run(issue=resumed_issue, emit_event=events.append)
+
+    assert result.status == "processed"
+    assert events[0].kind == "start"
+    assert "差し戻し内容を確認し、作業を再計画しました" in (events[0].notes or "")
+    assert events[-2] == SkillEvent("progress", "作業結果を確認してください。")
+    assert events[-1] == SkillEvent("final_review", "作業が終了しました。")
+    assert orchestrator.executions[-1]["announce_plan"] is False
+    assert orchestrator.executions[-1]["plan"].task_input == {
+        "instruction": "案内文を短くする"
+    }
+    assert len(llm.calls) == 1
+    state = graph.conversation_state(123)
+    assert state["last_ingested_journal_id"] == 2
+    assert state["feedback_analysis"]["requested_changes"] == ["短くする"]
+    assert sum(
+        "文章が長いので短くしてください" in str(message.content)
+        for message in state["messages"]
+    ) == 1
+
+    duplicate_events: list[SkillEvent] = []
+    duplicate_result = graph.run(
+        issue=resumed_issue,
+        emit_event=duplicate_events.append,
+    )
+    assert duplicate_result.status == "needs_user"
+    assert len(llm.calls) == 1
+    assert "修正内容をコメントしてください" in (duplicate_events[0].notes or "")
+
+
+def test_sqlite_checkpoint_resumes_with_a_new_graph_instance(tmp_path: Any) -> None:
+    database = tmp_path / "checkpoints.sqlite3"
+    first_orchestrator = FakeOrchestrator()
+    with SqliteSaver.from_conn_string(str(database)) as checkpointer:
+        first_graph = TicketConversationGraph(
+            task_orchestrator=first_orchestrator,  # type: ignore[arg-type]
+            llm=FakeLLM([]),
+            checkpointer=checkpointer,
+            ai_user_id=42,
+        )
+        first_graph.run(issue=_issue())
+
+    second_orchestrator = FakeOrchestrator()
+    with SqliteSaver.from_conn_string(str(database)) as checkpointer:
+        second_graph = TicketConversationGraph(
+            task_orchestrator=second_orchestrator,  # type: ignore[arg-type]
+            llm=FakeLLM([_revision_response()]),
+            checkpointer=checkpointer,
+            ai_user_id=42,
+        )
+        second_graph.run(
+            issue=_issue(
+                journals=[
+                    {"id": 10, "user": {"id": 7}, "notes": "短くしてください。"}
+                ]
+            )
+        )
+
+    assert len(second_orchestrator.executions) == 1
+    assert second_orchestrator.executions[0]["announce_plan"] is False
+
+
+def test_failed_revision_restarts_in_progress_before_execution() -> None:
+    orchestrator = FakeOrchestrator(fail_revision_once=True)
+    graph = TicketConversationGraph(
+        task_orchestrator=orchestrator,  # type: ignore[arg-type]
+        llm=FakeLLM([_revision_response()]),
+        checkpointer=InMemorySaver(),
+        ai_user_id=42,
+    )
+    graph.run(issue=_issue())
+    resumed_issue = _issue(
+        journals=[
+            {"id": 1, "user": {"id": 7}, "notes": "短く修正してください。"}
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="revision execution failed"):
+        graph.run(issue=resumed_issue)
+
+    events: list[SkillEvent] = []
+    result = graph.run(issue=resumed_issue, emit_event=events.append)
+
+    assert result.status == "processed"
+    assert events[0].kind == "start"
+    assert "中断した差し戻し作業を再開します" in (events[0].notes or "")
+    assert events[-2].kind == "progress"
+    assert events[-1] == SkillEvent("final_review", "作業が終了しました。")
+
+
+def test_resume_question_is_planned_and_executed_from_conversation() -> None:
+    response = (
+        '{"previous_work_summary":"記事の要約と登録を完了した",'
+        '"feedback_summary":"実施内容の説明を求められた",'
+        '"requested_changes":[],"keep_existing_results":["登録済みブックマーク"],'
+        '"work_to_redo":["作業履歴を確認する","実施内容を説明する"],'
+        '"task_plan":{"decision":"no_skill","reason":"会話履歴だけで回答できる",'
+        '"skill_name":null,"tool_names":[],"target_url":null,'
+        '"task_input":null,"user_request":null}}'
+    )
+    llm = FakeLLM([response])
+    orchestrator = FakeOrchestrator()
+    graph = TicketConversationGraph(
+        task_orchestrator=orchestrator,  # type: ignore[arg-type]
+        llm=llm,
+        checkpointer=InMemorySaver(),
+        ai_user_id=42,
+    )
+    graph.run(issue=_issue())
+    execution_count = len(orchestrator.executions)
+    events: list[SkillEvent] = []
+
+    result = graph.run(
+        issue=_issue(
+            journals=[
+                {"id": 1, "user": {"id": 42}, "notes": "要約を作成しました。"},
+                {"id": 2, "user": {"id": 7}, "notes": "作業を説明してください。"},
+            ]
+        ),
+        emit_event=events.append,
+    )
+
+    assert result.status == "processed"
+    assert len(orchestrator.executions) == execution_count + 1
+    assert orchestrator.executions[-1]["plan"].decision == "no_skill"
+    assert events[0].kind == "start"
+    assert "作業を再計画しました" in (events[0].notes or "")
+    assert events[-2] == SkillEvent("progress", "作業結果を確認してください。")
+    assert events[-1] == SkillEvent("final_review", "作業が終了しました。")
+    planner_messages = llm.calls[0]
+    assert "保存済みの作業状態と成果物" not in str(planner_messages)
+    assert any("保存済みの要約本文" in message["content"] for message in planner_messages)
+    assert "差し戻されました" in planner_messages[-1]["content"]
+    assert "作業を説明してください" in planner_messages[-1]["content"]
+    execution_messages = orchestrator.executions[-1]["conversation_messages"]
+    assert any("保存済みの要約本文" in message["content"] for message in execution_messages)
+    state = graph.conversation_state(123)
+    assert any(
+        isinstance(message, AIMessage) and message.content == "要約を作成しました。"
+        for message in state["messages"]
+    )

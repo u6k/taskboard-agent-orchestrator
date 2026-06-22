@@ -5,6 +5,12 @@
 
 RedmineでAIユーザーが担当しているチケットを1件取得し、チケットDescriptionから作業内容を理解して、必要なスキルを選択したうえで実行する one-shot CLI です。初期スキルとして「https://xxx をブリーフィング要約してブックマークに登録して。」のようなWebページ本文要約・ブックマーク登録に対応しています。
 
+各チケットは `redmine-issue-{チケットID}` をthread IDとするLangGraphの会話として扱います。初回依頼、AIの計画・作業ログ・成果、人間の追加コメントをSQLite Checkpointerへ保存します。人間からAIへ差し戻された場合は、保存済み会話へ未取り込みのRedmineコメントだけを追加し、指摘内容と修正計画をRedmineへコメントしてから必要な作業だけを再開します。
+
+スキルの工程ログはRedmineへ直接書き込まず、LangGraphのAIMessageと構造化artifactsへ保存してからRedmineコメントへ同期します。差し戻し時は質問・作業依頼を問わず、会話履歴へ人間コメントと再計画指示だけを追加して必ず計画を作成します。質問・説明要求の場合は、その計画に従って保存済みの会話、要約、URL、ブックマーク結果から回答し、toolやスキルを再実行しません。
+
+新規実行と差し戻し実行はいずれも、作業内容・再計画のコメントとともに進行中へ更新し、作業結果を進捗コメントとして投稿した後、「作業が終了しました。」のコメントとともにレビュー中へ更新して起票者へ担当を戻します。失敗checkpointから実行だけを再開する場合も、再開する作業内容をコメントして進行中へ戻してから同じ終了処理を行います。
+
 AIエージェントは、チケットを読み取ったら依頼内容の理解、判断理由、実行方法、作業開始を1つのコメントにまとめて残します。その後、スキルまたはtoolが工程ごとの結果、作業完了報告、またはユーザー確認事項をコメントし、完了時や確認待ち時はステータスをレビュー中に更新して担当者をチケット起票者へ戻します。
 
 AIエージェントは利用可能なスキル一覧とtool一覧を見て実行方法を決めます。toolを1つまたは複数使えば依頼内容を過不足なく実行できる場合は、スキルを使わずtoolだけで実行します。依頼目的全体がスキルの目的と一致し、toolを個別に組み合わせるよりスキル手順に従う方が適切な場合だけスキルを使います。該当スキルやtoolがない場合は、外部ツールなしで完了できる作業だけを実行し、依頼内容が不明確または必要なスキル・ツールが不足している場合は、ユーザーに求める追記内容をコメントしてレビュー中に戻します。
@@ -32,9 +38,14 @@ LLM_MODEL=replace-with-litellm-model
 LINKACE_URL=https://linkace.example.com
 LINKACE_API_KEY=replace-with-linkace-api-key
 LINKACE_SUMMARIZED_LIST_ID=10
+LANGGRAPH_CHECKPOINT_DB_PATH=.taskboard-agent/checkpoints.sqlite3
 ```
 
+`LANGGRAPH_CHECKPOINT_DB_PATH` はチケット単位のLangGraph会話コンテキストを保存するSQLiteファイルです。`--dry-run` ではインメモリCheckpointerを使用するため、このファイルは更新されません。
+
 言語モデルの呼び出しはLiteLLM経由で行います。`LLM_MODEL` には `openai/gpt-4.1-mini`、`anthropic/claude-...`、`gemini/...`、`ollama/...`、`lm_studio/...` などLiteLLMが扱うモデル名を指定し、APIキーやAPI Base URLは各プロバイダが要求する環境変数に設定してください。
+
+計画、再計画、および実行状態など機械処理する応答には、プロンプト上のJSONテンプレートではなくLiteLLMの `response_format` からStrict JSON Schemaを指定します。LiteLLM側のスキーマ検証も有効にするため、利用するプロバイダ、推論サーバー、モデルがStructured Outputsに対応している必要があります。Redmineへ投稿する本文はMarkdownとして生成します。LM Studio利用時に `response_format.type=json_schema` が未対応の場合は、チケット処理前にLM StudioまたはモデルをStructured Outputs対応構成へ変更してください。
 
 OpenAIのモデルを使う場合の例:
 
@@ -72,6 +83,12 @@ LinkAce登録時、ブリーフィング要約を生成する前に同じURLの�
 
 ```powershell
 uv run taskboard-agent run-once
+```
+
+デバッグ時にチケット検索を省略して特定のチケットを直接処理する場合:
+
+```powershell
+uv run taskboard-agent run-once --issue-id 123
 ```
 
 Redmineや外部サービスを更新せずに、依頼理解、スキル選択、ツール実行結果だけ確認する場合:
