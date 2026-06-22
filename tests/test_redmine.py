@@ -64,6 +64,27 @@ def test_update_description_note_and_reassign_sends_description_notes_and_assign
     }
 
 
+def test_get_issue_requests_journals() -> None:
+    seen_request: httpx.Request | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_request
+        seen_request = request
+        return httpx.Response(200, json={"issue": {"id": 123, "journals": []}})
+
+    client = RedmineClient(
+        "https://redmine.example.test",
+        "api-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    issue = client.get_issue(123)
+
+    assert issue["id"] == 123
+    assert seen_request is not None
+    assert httpx.QueryParams(seen_request.url.query)["include"] == "journals"
+
+
 def test_update_issue_sends_notes_status_and_assignment() -> None:
     seen_body: dict[str, object] | None = None
 

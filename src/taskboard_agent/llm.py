@@ -53,6 +53,7 @@ class LiteLLMClient:
         *,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = "auto",
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -61,6 +62,10 @@ class LiteLLMClient:
         if tools is not None:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+            if response_format.get("type") == "json_schema":
+                kwargs["enable_json_schema_validation"] = True
         logger.debug(
             "LLM入力プロンプト model=%s payload=%s",
             self._model,
@@ -69,6 +74,7 @@ class LiteLLMClient:
                     "messages": messages,
                     "tools": tools,
                     "tool_choice": tool_choice if tools is not None else None,
+                    "response_format": response_format,
                 }
             ),
         )

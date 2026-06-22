@@ -99,3 +99,35 @@ def test_litellm_client_reads_tool_calls(monkeypatch: pytest.MonkeyPatch) -> Non
     assert response.tool_calls[0].id == "call-1"
     assert response.tool_calls[0].name == "echo"
     assert response.tool_calls[0].arguments == '{"text": "hello"}'
+
+
+def test_litellm_client_passes_strict_json_schema_and_enables_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "result",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "required": ["status"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    def fake_completion(**kwargs: object) -> dict[str, object]:
+        assert kwargs["response_format"] == response_format
+        assert kwargs["enable_json_schema_validation"] is True
+        return {"choices": [{"message": {"content": '{"status":"ok"}'}}]}
+
+    monkeypatch.setattr("taskboard_agent.llm.litellm.completion", fake_completion)
+
+    response = LiteLLMClient("test-model").complete(
+        [{"role": "user", "content": "hello"}],
+        response_format=response_format,
+    )
+
+    assert response.content == '{"status":"ok"}'

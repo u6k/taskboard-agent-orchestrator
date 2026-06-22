@@ -17,6 +17,7 @@ ENV_KEYS = [
     "LINKACE_URL",
     "LINKACE_API_KEY",
     "LINKACE_SUMMARIZED_LIST_ID",
+    "LANGGRAPH_CHECKPOINT_DB_PATH",
 ]
 
 
@@ -40,6 +41,7 @@ def test_load_config_reads_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
                 "LINKACE_URL=https://linkace.example.test/",
                 "LINKACE_API_KEY=linkace-key",
                 "LINKACE_SUMMARIZED_LIST_ID=10",
+                "LANGGRAPH_CHECKPOINT_DB_PATH=var/test-checkpoints.sqlite3",
             ]
         ),
         encoding="utf-8",
@@ -56,6 +58,9 @@ def test_load_config_reads_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert config.linkace_url == "https://linkace.example.test"
     assert config.linkace_api_key == "linkace-key"
     assert config.linkace_summarized_list_id == 10
+    assert config.langgraph_checkpoint_db_path == Path(
+        "var/test-checkpoints.sqlite3"
+    )
 
 
 def test_load_config_real_env_overrides_dotenv(

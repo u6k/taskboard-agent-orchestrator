@@ -20,6 +20,7 @@ class AgentLLMPort(Protocol):
         *,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = "auto",
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
         ...
 
@@ -52,6 +53,7 @@ class FunctionCallingAgent:
         allow_writes: bool = False,
         approved_tools: set[str] | None = None,
         on_llm_response: Callable[[LLMResponse], None] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> AgentRunResult:
         registry = tools or self._tools
         if registry is None:
@@ -65,6 +67,7 @@ class FunctionCallingAgent:
                 working_messages,
                 tools=registry.litellm_tools(),
                 tool_choice="auto",
+                response_format=response_format,
             )
             if not response.tool_calls:
                 if response.content:

@@ -152,6 +152,23 @@ def test_run_once_no_issue_does_not_execute() -> None:
     assert redmine.updated == []
 
 
+def test_run_once_processes_explicit_issue_without_searching() -> None:
+    redmine = FakeRedmine([], _issue())
+    executor = FakeTaskExecutor()
+
+    result = run_once(
+        config=CONFIG,
+        redmine=redmine,
+        task_executor=executor,
+        issue_id=123,
+    )
+
+    assert result.status == "processed"
+    assert result.issue_id == 123
+    assert redmine.requested_assignee is None
+    assert executor.calls[0]["issue"]["id"] == 123
+
+
 def test_run_once_applies_skill_events_to_redmine() -> None:
     redmine = FakeRedmine([{"id": 123}], _issue())
 

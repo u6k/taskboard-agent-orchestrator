@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import logging
 import sys
 from pathlib import Path
+
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from taskboard_agent.agent import FunctionCallingAgent
 from taskboard_agent.config import ConfigError, load_config
@@ -19,11 +23,22 @@ from taskboard_agent.task_executor import (
     TaskOrchestrator,
     TaskPlanningError,
 )
+from taskboard_agent.ticket_graph import TicketConversationGraph
 from taskboard_agent.tool_loader import ToolRuntimeContext, ToolScriptCatalog
 from taskboard_agent.workflow import WorkflowError, run_once
 
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_issue_id(value: str) -> int:
+    try:
+        issue_id = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("issue ID must be an integer") from exc
+    if issue_id <= 0:
+        raise argparse.ArgumentTypeError("issue ID must be a positive integer")
+    return issue_id
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Understand and execute the issue without updating Redmine or external services."
+        ),
+    )
+    run_once_parser.add_argument(
+        "--issue-id",
+        type=_positive_issue_id,
+        help=(
+            "Process this Redmine issue directly instead of searching for an open "
+            "issue assigned to the AI user."
         ),
     )
 
@@ -78,19 +101,36 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
             ),
         )
-        task_executor = TaskOrchestrator(
+        task_orchestrator = TaskOrchestrator(
             planner=LiteLLMTaskPlanner(llm),
             skill_registry=skill_registry,
             tool_catalog=tool_catalog,
             skill_agent=skill_agent,
             generic_runner=GenericTaskRunner(llm),
         )
-        result = run_once(
-            config=config,
-            redmine=redmine,
-            task_executor=task_executor,
-            dry_run=args.dry_run,
-        )
+        if args.dry_run:
+            checkpointer_context = nullcontext(InMemorySaver())
+        else:
+            config.langgraph_checkpoint_db_path.parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            checkpointer_context = SqliteSaver.from_conn_string(
+                str(config.langgraph_checkpoint_db_path)
+            )
+        with checkpointer_context as checkpointer:
+            task_executor = TicketConversationGraph(
+                task_orchestrator=task_orchestrator,
+                llm=llm,
+                checkpointer=checkpointer,
+                ai_user_id=config.redmine_ai_user_id,
+            )
+            result = run_once(
+                config=config,
+                redmine=redmine,
+                task_executor=task_executor,
+                dry_run=args.dry_run,
+                issue_id=args.issue_id,
+            )
     except (
         ConfigError,
         LinkAceError,

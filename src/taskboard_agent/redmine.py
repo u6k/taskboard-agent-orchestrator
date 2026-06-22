@@ -46,7 +46,10 @@ class RedmineClient:
         return issues
 
     def get_issue(self, issue_id: int) -> dict[str, Any]:
-        response = self._client.get(f"/issues/{issue_id}.json")
+        response = self._client.get(
+            f"/issues/{issue_id}.json",
+            params={"include": "journals"},
+        )
         data = _json_or_raise(response, f"failed to fetch Redmine issue #{issue_id}")
         issue = data.get("issue")
         if not isinstance(issue, dict):

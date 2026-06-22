@@ -249,13 +249,10 @@ def _add_comment(
     notes: str,
     intended_comments: list[str],
 ) -> bool:
+    # Redmineへの投稿はLangGraph/Workflowのイベント処理へ一本化する。
+    del context, issue_id
     intended_comments.append(notes)
-    _, error = _call(
-        context,
-        "redmine_add_comment",
-        {"issue_id": issue_id, "notes": notes},
-    )
-    return error is None
+    return True
 
 
 def _fail(
@@ -295,8 +292,7 @@ def _result(
     comments: list[str] | None = None,
 ) -> SkillExecutionResult:
     events: list[SkillEvent] = []
-    if context.dry_run:
-        events.extend(SkillEvent("progress", notes) for notes in comments or [])
+    events.extend(SkillEvent("progress", notes) for notes in comments or [])
     events.append(SkillEvent("final_review", None))
     return SkillExecutionResult(
         status=status,

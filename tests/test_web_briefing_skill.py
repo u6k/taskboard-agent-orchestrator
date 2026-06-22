@@ -43,7 +43,6 @@ def _run(
 
 def test_scripted_skill_runs_steps_in_order_and_posts_full_summary() -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
-    comments: list[str] = []
 
     def record(name: str, result: dict[str, Any]):
         def handle(**arguments: Any) -> dict[str, Any]:
@@ -53,9 +52,7 @@ def test_scripted_skill_runs_steps_in_order_and_posts_full_summary() -> None:
         return handle
 
     def comment(**arguments: Any) -> dict[str, Any]:
-        calls.append(("redmine_add_comment", arguments))
-        comments.append(arguments["notes"])
-        return {"ok": True}
+        raise AssertionError("スキルがRedmineへ直接コメントしました")
 
     result = _run(
         {
@@ -97,12 +94,10 @@ def test_scripted_skill_runs_steps_in_order_and_posts_full_summary() -> None:
     assert [name for name, _ in calls] == [
         "linkace_find_link",
         "fetch_web_page",
-        "redmine_add_comment",
         "summarize_briefing",
-        "redmine_add_comment",
         "linkace_add_link",
-        "redmine_add_comment",
     ]
+    comments = [event.notes or "" for event in result.events]
     assert "https://example.test/final" in comments[0]
     assert "要約全文" in comments[1]
     assert "登録しました" in comments[2]
@@ -143,8 +138,8 @@ def test_scripted_skill_stops_for_existing_bookmark_outside_source_list() -> Non
 
     assert result.status == "already_done"
     assert result.bookmark_url == "https://linkace.example.test/links/12"
-    assert calls == ["find", "comment"]
-    assert "要約、登録、更新は行いません" in comments[0]
+    assert calls == ["find"]
+    assert "要約、登録、更新は行いません" in (result.events[0].notes or "")
     assert result.events[-1].notes == "作業が終了しました。"
 
 
@@ -179,12 +174,12 @@ def test_scripted_skill_stops_after_step_failure_and_comments_reason() -> None:
     )
 
     assert result.status == "failed"
-    assert calls == ["find", "fetch", "comment"]
-    assert "Webページの取得に失敗" in comments[0]
-    assert "HTTP 500" in comments[0]
+    assert calls == ["find", "fetch"]
+    assert "Webページの取得に失敗" in (result.events[0].notes or "")
+    assert "HTTP 500" in (result.events[0].notes or "")
 
 
-def test_scripted_skill_stops_when_progress_comment_fails() -> None:
+def test_scripted_skill_does_not_write_redmine_directly() -> None:
     calls: list[str] = []
 
     def find(**arguments: Any) -> dict[str, Any]:
@@ -201,24 +196,32 @@ def test_scripted_skill_stops_when_progress_comment_fails() -> None:
         }
 
     def comment(**arguments: Any) -> dict[str, Any]:
-        calls.append("comment")
-        return {"ok": False, "error": "Redmine unavailable"}
+        raise AssertionError("スキルがRedmineへ直接コメントしました")
 
-    def unexpected(**arguments: Any) -> dict[str, Any]:
-        raise AssertionError("コメント失敗後のtoolが呼ばれました")
+    def summarize(**arguments: Any) -> dict[str, Any]:
+        calls.append("summarize")
+        return {"ok": True, "briefing": "要約"}
+
+    def add(**arguments: Any) -> dict[str, Any]:
+        calls.append("add")
+        return {
+            "ok": True,
+            "payload": {},
+            "bookmark": {"action": "created", "url": "https://bookmark.test/1"},
+        }
 
     result = _run(
         {
             "linkace_find_link": find,
             "fetch_web_page": fetch,
-            "summarize_briefing": unexpected,
-            "linkace_add_link": unexpected,
+            "summarize_briefing": summarize,
+            "linkace_add_link": add,
             "redmine_add_comment": comment,
         }
     )
 
-    assert result.status == "failed"
-    assert calls == ["find", "fetch", "comment"]
+    assert result.status == "processed"
+    assert calls == ["find", "fetch", "summarize", "add"]
 
 
 def test_scripted_skill_prefers_explicit_target_for_multiple_urls() -> None:
@@ -252,11 +255,8 @@ def test_scripted_skill_prefers_explicit_target_for_multiple_urls() -> None:
 
 
 def test_scripted_skill_rejects_ambiguous_urls_without_fetching() -> None:
-    comments: list[str] = []
-
     def comment(**arguments: Any) -> dict[str, Any]:
-        comments.append(arguments["notes"])
-        return {"ok": True}
+        raise AssertionError("スキルがRedmineへ直接コメントしました")
 
     def unexpected(**arguments: Any) -> dict[str, Any]:
         raise AssertionError("URL確定前にtoolが呼ばれました")
@@ -273,7 +273,7 @@ def test_scripted_skill_rejects_ambiguous_urls_without_fetching() -> None:
     )
 
     assert result.status == "needs_user"
-    assert "一意に特定できません" in comments[0]
+    assert "一意に特定できません" in (result.events[0].notes or "")
 
 
 class FakeRedmine:

@@ -66,22 +66,33 @@ def run_once(
     redmine: RedminePort,
     task_executor: TaskExecutorPort,
     dry_run: bool = False,
+    issue_id: int | None = None,
 ) -> RunResult:
-    with log_trace("run-once"):
-        logger.info(
-            "Redmineの未完了チケットを検索します assigned_to_id=%s dry_run=%s",
-            config.redmine_ai_user_id,
-            dry_run,
-        )
-        summaries = redmine.find_open_issues_assigned_to(config.redmine_ai_user_id)
-        if not summaries:
-            logger.warning(
-                "処理対象のチケットがありません assigned_to_id=%s status=no_issue",
+    if issue_id is None:
+        with log_trace("run-once"):
+            logger.info(
+                "Redmineの未完了チケットを検索します assigned_to_id=%s dry_run=%s",
                 config.redmine_ai_user_id,
+                dry_run,
             )
-            return RunResult(status="no_issue", dry_run=dry_run)
+            summaries = redmine.find_open_issues_assigned_to(config.redmine_ai_user_id)
+            if not summaries:
+                logger.warning(
+                    "処理対象のチケットがありません assigned_to_id=%s status=no_issue",
+                    config.redmine_ai_user_id,
+                )
+                return RunResult(status="no_issue", dry_run=dry_run)
+        issue_id = _require_issue_id(summaries[0])
+    elif issue_id <= 0:
+        raise WorkflowError("issue_id must be a positive integer")
+    else:
+        with log_trace(f"issue#{issue_id}"):
+            logger.info(
+                "CLIで指定されたRedmineチケットを処理します issue_id=%s dry_run=%s",
+                issue_id,
+                dry_run,
+            )
 
-    issue_id = _require_issue_id(summaries[0])
     with log_trace(f"issue#{issue_id}"):
         logger.info("Redmineチケットを取得します issue_id=%s", issue_id)
         issue = redmine.get_issue(issue_id)

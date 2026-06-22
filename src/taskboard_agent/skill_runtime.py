@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 from taskboard_agent.agent import AgentRunResult
 from taskboard_agent.llm import LLMResponse
 from taskboard_agent.skills import Skill
+from taskboard_agent.structured_output import skill_execution_response_format
 from taskboard_agent.tools import ToolRegistry
 
 
@@ -29,6 +30,7 @@ class SkillAgentPort(Protocol):
         allow_writes: bool = False,
         approved_tools: set[str] | None = None,
         on_llm_response: Callable[[LLMResponse], None] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> AgentRunResult:
         ...
 
@@ -140,6 +142,7 @@ class GenericSkillRunner:
             tools=self._tools,
             allow_writes=not dry_run,
             on_llm_response=record_llm_response,
+            response_format=skill_execution_response_format(),
         )
         final = _parse_final_json(agent_result.final_text)
         result = _to_skill_execution_result(
@@ -166,7 +169,7 @@ def _build_skill_messages(
                 "あなたはRedmineチケットを処理するAIエージェントです。"
                 "必ず提供されたSKILL.mdの手順と利用可能なfunction toolsだけで作業してください。"
                 "tool結果のok=falseは失敗として扱い、必要なら追加作業を止めてユーザー確認を求めてください。"
-                "最終応答はJSONだけにしてください。"
+                "最終的な作業状態とRedmine向け報告を返してください。出力構造はAPI側で指定されています。"
             ),
         },
         {
@@ -176,18 +179,10 @@ def _build_skill_messages(
                 f"スキル説明: {skill.description}\n\n"
                 "SKILL.md:\n"
                 f"{skill.body}\n\n"
-                "実行コンテキストJSON:\n"
+                "実行コンテキスト:\n"
                 f"{json.dumps({'issue': issue, 'task_input': task_input, 'dry_run': dry_run}, ensure_ascii=False)}\n\n"
-                "最終応答JSON形式:\n"
-                "{"
-                '"status": "processed|needs_user|missing_tool|failed|already_done", '
-                '"notes": "Redmineに投稿する自然な日本語の作業報告またはユーザーに求めること。実行した内容、確認したこと、成果物、未処理事項を含める。JSON文字列や内部statusの説明は書かない", '
-                '"target_url": "任意", '
-                '"page_title": "任意", '
-                '"briefing": "任意", '
-                '"bookmark_url": "任意", '
-                '"bookmark_payload": "任意のobjectまたはnull"'
-                "}"
+                "notesにはRedmineへ投稿する自然な日本語の作業報告またはユーザーに求めることを記載し、"
+                "実行内容、確認内容、成果物、未処理事項を含めてください。"
             ),
         },
     ]
