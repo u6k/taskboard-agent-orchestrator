@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -35,7 +36,7 @@ class SkillAgentPort(Protocol):
 @dataclass(frozen=True)
 class SkillEvent:
     kind: SkillEventKind
-    notes: str
+    notes: str | None
 
 
 SkillEventSink = Callable[[SkillEvent], None]
@@ -51,6 +52,52 @@ class SkillExecutionResult:
     bookmark_url: str | None = None
     bookmark_payload: dict[str, Any] | None = None
     dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class ScriptedSkillContext:
+    issue: dict[str, Any]
+    task_input: dict[str, Any]
+    dry_run: bool
+    tools: ToolRegistry
+
+    def execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        return self.tools.execute(
+            name,
+            arguments,
+            allow_writes=not self.dry_run,
+        ).content
+
+
+class ScriptedSkillRunner:
+    def __init__(self, *, skill: Skill, tools: ToolRegistry) -> None:
+        self._skill = skill
+        self._tools = tools
+
+    def run(
+        self,
+        *,
+        issue: dict[str, Any],
+        task_input: dict[str, Any] | None = None,
+        dry_run: bool = False,
+        emit_event: SkillEventSink | None = None,
+    ) -> SkillExecutionResult:
+        del emit_event
+        self._tools.require_registered(self._skill.required_tools)
+        run = _load_scripted_skill(self._skill)
+        result = run(
+            ScriptedSkillContext(
+                issue=issue,
+                task_input=task_input or {},
+                dry_run=dry_run,
+                tools=self._tools,
+            )
+        )
+        if not isinstance(result, SkillExecutionResult):
+            raise SkillRuntimeError(
+                f"skill runner must return SkillExecutionResult: {self._skill.name}"
+            )
+        return _add_agent_completion_notes(result)
 
 
 class GenericSkillRunner:
@@ -253,3 +300,40 @@ def _truncate(value: str) -> str:
     if len(value) <= MAX_LLM_COMMENT_CHARS:
         return value
     return f"{value[:MAX_LLM_COMMENT_CHARS]}...(省略)"
+
+
+def _load_scripted_skill(skill: Skill) -> Callable[[ScriptedSkillContext], Any]:
+    if skill.runner is None:
+        raise SkillRuntimeError(f"skill does not define a runner: {skill.name}")
+    path = skill.path.parent / skill.runner
+    module_name = f"_taskboard_agent_skill_runner_{skill.name.replace('-', '_')}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise SkillRuntimeError(f"failed to load skill runner: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    run = getattr(module, "run", None)
+    if not callable(run):
+        raise SkillRuntimeError(f"skill runner missing run(context): {path}")
+    return run
+
+
+def _add_agent_completion_notes(result: SkillExecutionResult) -> SkillExecutionResult:
+    if result.status not in ("processed", "already_done", "dry_run"):
+        return result
+    events = list(result.events)
+    for index in range(len(events) - 1, -1, -1):
+        event = events[index]
+        if event.kind == "final_review" and event.notes is None:
+            events[index] = SkillEvent("final_review", "作業が終了しました。")
+            break
+    return SkillExecutionResult(
+        status=result.status,
+        events=tuple(events),
+        target_url=result.target_url,
+        page_title=result.page_title,
+        briefing=result.briefing,
+        bookmark_url=result.bookmark_url,
+        bookmark_payload=result.bookmark_payload,
+        dry_run=result.dry_run,
+    )

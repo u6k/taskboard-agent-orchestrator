@@ -217,7 +217,7 @@ def test_run_once_needs_user_returns_to_author_for_review() -> None:
     ]
 
 
-def test_run_once_final_return_returns_to_author_without_review_status() -> None:
+def test_run_once_final_return_returns_to_author_for_review() -> None:
     redmine = FakeRedmine([{"id": 123}], _issue())
     executor = FakeTaskExecutor(
         SkillExecutionResult(
@@ -239,8 +239,31 @@ def test_run_once_final_return_returns_to_author_without_review_status() -> None
             {
                 "notes": "必要なtoolがありません。",
                 "assigned_to_id": 7,
+                "status_id": 10,
             },
         )
+    ]
+
+
+def test_run_once_can_return_to_review_without_adding_a_comment() -> None:
+    redmine = FakeRedmine([{"id": 123}], _issue())
+    executor = FakeTaskExecutor(
+        SkillExecutionResult(
+            status="processed",
+            events=(SkillEvent("final_review", None),),
+        )
+    )
+
+    result = run_once(
+        config=CONFIG,
+        redmine=redmine,
+        task_executor=executor,
+    )
+
+    assert result.status == "processed"
+    assert result.comments == ()
+    assert redmine.updated == [
+        (123, {"assigned_to_id": 7, "status_id": 10})
     ]
 
 
@@ -278,7 +301,11 @@ def test_run_once_executor_failure_comments_and_returns_to_author() -> None:
     assert "AIエージェントの実行に失敗" in result.comments[-1]
     assert redmine.updated[-1] == (
         123,
-        {"notes": result.comments[-1], "assigned_to_id": 7},
+        {
+            "notes": result.comments[-1],
+            "assigned_to_id": 7,
+            "status_id": 10,
+        },
     )
 
 

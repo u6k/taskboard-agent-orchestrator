@@ -177,6 +177,69 @@ def test_parse_task_plan_rejects_invalid_decision() -> None:
         parse_task_plan('{"decision": "bad", "reason": "x"}')
 
 
+def test_parse_task_plan_normalizes_quoted_null_for_nullable_fields() -> None:
+    plan = parse_task_plan(
+        '{"decision": "use_skill", "skill_name": "web-briefing-bookmark", '
+        '"tool_names": [], "target_url": "https://example.test/article", '
+        '"task_input": "null", "reason": "対象", "user_request": "null"}'
+    )
+
+    assert plan.task_input is None
+    assert plan.user_request is None
+
+
+def test_parse_task_plan_rejects_non_null_string_task_input() -> None:
+    with pytest.raises(TaskPlanningError, match="object or null"):
+        parse_task_plan(
+            '{"decision": "use_skill", "skill_name": "web-briefing-bookmark", '
+            '"tool_names": [], "target_url": null, "task_input": "bad", '
+            '"reason": "対象", "user_request": null}'
+        )
+
+
+def test_task_planner_retries_with_validation_error_and_accepts_correction() -> None:
+    llm = FakeLLM(
+        [
+            '{"decision": "use_skill", "skill_name": "web-briefing-bookmark", '
+            '"tool_names": ["fetch_web_page"], '
+            '"target_url": "https://example.test/article", '
+            '"task_input": "null", "reason": "対象", "user_request": "null"}',
+            '{"decision": "use_skill", "skill_name": "web-briefing-bookmark", '
+            '"tool_names": [], "target_url": "https://example.test/article", '
+            '"task_input": null, "reason": "対象", "user_request": null}',
+        ]
+    )
+
+    plan = LiteLLMTaskPlanner(llm).plan(
+        _issue(),
+        [_skill()],
+        [{"name": "fetch_web_page", "description": "本文取得"}],
+    )
+
+    assert plan.decision == "use_skill"
+    assert len(llm.messages) == 2
+    assert "tool_names to be an empty array" in llm.messages[1][-1]["content"]
+    assert '文字列の "null"' in llm.messages[1][-1]["content"]
+
+
+def test_task_planner_fails_after_two_correction_retries() -> None:
+    invalid = (
+        '{"decision": "use_skill", "skill_name": "web-briefing-bookmark", '
+        '"tool_names": ["fetch_web_page"], "target_url": null, '
+        '"task_input": null, "reason": "対象", "user_request": null}'
+    )
+    llm = FakeLLM([invalid, invalid, invalid])
+
+    with pytest.raises(TaskPlanningError, match="after 3 attempts"):
+        LiteLLMTaskPlanner(llm).plan(
+            _issue(),
+            [_skill()],
+            [{"name": "fetch_web_page", "description": "本文取得"}],
+        )
+
+    assert len(llm.messages) == 3
+
+
 def test_task_planner_includes_available_skills_in_prompt() -> None:
     llm = FakeLLM(
         [
@@ -195,6 +258,8 @@ def test_task_planner_includes_available_skills_in_prompt() -> None:
     assert plan.skill_name == "web-briefing-bookmark"
     assert "web-briefing-bookmark" in llm.messages[0][1]["content"]
     assert "fetch_web_page" in llm.messages[0][1]["content"]
+    assert '"task_input": null' in llm.messages[0][1]["content"]
+    assert "文字列は禁止" in llm.messages[0][1]["content"]
 
 
 def test_task_planner_can_choose_direct_tools_for_narrow_request() -> None:

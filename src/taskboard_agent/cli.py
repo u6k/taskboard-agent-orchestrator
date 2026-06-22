@@ -70,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
                     "llm": llm,
                     "page_fetcher": page_fetcher,
                     "bookmark_client": bookmark_client,
+                    "redmine_client": redmine,
                 },
                 settings={
                     "linkace_summarized_list_id": config.linkace_summarized_list_id,

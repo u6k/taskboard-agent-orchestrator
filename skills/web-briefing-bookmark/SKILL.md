@@ -1,29 +1,40 @@
 ---
 name: "web-briefing-bookmark"
 description: "指定URLのWebページ本文を取得し、ブリーフィング要約を作成してLinkAceへ登録する。"
+runner: "run.py"
 required_tools:
-  - linkace_check_auth
+  - redmine_add_comment
+  - linkace_find_link
   - fetch_web_page
   - summarize_briefing
-  - linkace_find_link
   - linkace_add_link
 risk_level: "write"
 ---
 
-# 手順
+# 目的
 
-1. チケット本文から対象URLを1件特定する。
-2. dry-runでなければ `linkace_check_auth` でLinkAce APIトークンの認証を確認する。
-3. `linkace_find_link` で既存ブックマークを確認する。
-4. 既存ブックマークがあり、tool結果の `bookmark.has_source_list` が false の場合は、要約や登録を行わず、既存ブックマークURLを示して `already_done` で終了する。
-5. `fetch_web_page` でページタイトルと本文を取得する。
-6. リダイレクトなどで最終URLが変わった場合は、最終URLでも `linkace_find_link` を実行する。既存ブックマークがあり `bookmark.has_source_list` が false の場合は、要約や登録を行わず、既存ブックマークURLを示して `already_done` で終了する。
-7. `summarize_briefing` で客観的なブリーフィング要約を作成する。
-8. `linkace_add_link` でURL、タイトル、要約を登録する。dry-runでもpayload確認のために呼び出す。
-9. 最終応答JSONの `notes` に実施内容、成果物URL、確認してほしい点を記録する。
+チケットで指定されたWebページをブリーフィング要約し、LinkAceへ登録または更新する。
+この文書をスキル仕様の正本とし、処理順序と条件分岐は `run.py` で決定的に実行する。
 
-# 注意点
+# 作業手順
 
-- LinkAce登録は書き込み操作なので、dry-run または承認ポリシーを必ず尊重する。
-- ログイン、有料ページ、本文抽出不能、既存登録済みの場合は作業を中断し、人間が判断できるコメントを残す。
-- 複数URLがある場合は依頼対象として最も明確な1件だけを処理する。
+1. チケットから対象URLを1件特定する。実行コンテキストで対象URLが明示されている場合はそれを優先する。
+2. `linkace_find_link` で依頼URLの既存登録を確認する。
+3. 既存ブックマークがリストID `1` に属していない場合は、要約、登録、更新を行わず、既存ブックマークURLと未処理理由をチケットへコメントして終了する。
+4. `fetch_web_page` で最終URL、ページタイトル、本文を取得し、最終URLとタイトルをチケットへコメントする。
+5. `summarize_briefing` に最終URL、タイトル、本文を渡し、取得したブリーフィング要約全文をチケットへコメントする。
+6. `linkace_add_link` に最終URL、タイトル、要約を渡し、登録、更新、または登録済みの結果とブックマークURLをチケットへコメントする。
+7. チケットを起票者へ返してレビュー中にし、終了する。
+
+# 条件分岐と失敗時の扱い
+
+- 対象URLがない場合、または複数あって一意に決められない場合は、確認事項をコメントして後続処理を行わない。
+- 各toolが失敗した場合は、失敗した工程と理由をコメントし、後続処理を停止する。
+- チケットコメントの追加に失敗した場合も、後続処理を停止する。
+- 正常終了、既存登録済み、確認待ち、工程失敗のいずれも、チケットを起票者へ返してレビュー中にする。
+
+# dry-run
+
+- RedmineとLinkAceへ書き込まない。
+- ページ取得と要約生成は実行する。
+- 投稿予定コメントとLinkAce登録payloadを実行結果で確認できるようにする。
