@@ -16,14 +16,18 @@ class Skill:
     risk_level: str
     path: Path
     body: str
+    runner: str | None = None
 
     def summary(self) -> dict[str, object]:
-        return {
+        summary: dict[str, object] = {
             "name": self.name,
             "description": self.description,
             "required_tools": list(self.required_tools),
             "risk_level": self.risk_level,
         }
+        if self.runner is not None:
+            summary["runner"] = self.runner
+        return summary
 
 
 class SkillRegistry:
@@ -77,6 +81,15 @@ def _load_skill(path: Path) -> Skill:
     risk_level = metadata.get("risk_level", "read")
     if not isinstance(risk_level, str):
         raise SkillRegistryError(f"skill risk_level must be a string: {path}")
+    runner = metadata.get("runner")
+    if runner is not None and (not isinstance(runner, str) or not runner):
+        raise SkillRegistryError(f"skill runner must be a string: {path}")
+    if isinstance(runner, str):
+        runner_path = Path(runner)
+        if runner_path.is_absolute() or ".." in runner_path.parts:
+            raise SkillRegistryError(f"skill runner must be relative to the skill directory: {path}")
+        if not (path.parent / runner_path).is_file():
+            raise SkillRegistryError(f"skill runner does not exist: {path.parent / runner_path}")
     return Skill(
         name=name,
         description=description,
@@ -84,6 +97,7 @@ def _load_skill(path: Path) -> Skill:
         risk_level=risk_level,
         path=path,
         body=body.strip(),
+        runner=runner,
     )
 
 

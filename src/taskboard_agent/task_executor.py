@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 from taskboard_agent.llm import LLMResponse
 from taskboard_agent.skill_runtime import (
     GenericSkillRunner,
+    ScriptedSkillRunner,
     SkillAgentPort,
     SkillEventSink,
     SkillEvent,
@@ -19,6 +21,8 @@ from taskboard_agent.tools import ToolRegistry, ToolRegistryError
 
 PlanDecision = Literal["use_skill", "use_tools", "no_skill", "needs_user"]
 GenericStatus = Literal["completed", "needs_user", "missing_tool"]
+MAX_TASK_PLAN_ATTEMPTS = 3
+logger = logging.getLogger(__name__)
 
 
 class TaskPlanningError(RuntimeError):
@@ -65,26 +69,52 @@ class LiteLLMTaskPlanner:
         skills: list[Skill],
         tools: list[dict[str, Any]],
     ) -> TaskPlan:
-        response = self._llm.complete(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "あなたはRedmineチケットの作業内容を理解し、利用すべきスキルを選ぶAIです。"
-                        "利用可能なtoolだけで依頼を過不足なく実行できる場合はuse_toolsにしてください。"
-                        "スキルは依頼目的全体がスキルの目的と一致する場合だけ使ってください。"
-                        "依頼が曖昧、必要情報が不足、または必要なtool/skillが不足している場合はneeds_userにしてください。"
-                        "既存スキルなしで言語モデルだけで完了できる作業はno_skillにしてください。"
-                        "出力はJSONのみです。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": _build_planning_prompt(issue, skills, tools),
-                },
-            ]
-        )
-        return parse_task_plan(response.content)
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "あなたはRedmineチケットの作業内容を理解し、利用すべきスキルを選ぶAIです。"
+                    "利用可能なtoolだけで依頼を過不足なく実行できる場合はuse_toolsにしてください。"
+                    "スキルは依頼目的全体がスキルの目的と一致する場合だけ使ってください。"
+                    "依頼が曖昧、必要情報が不足、または必要なtool/skillが不足している場合はneeds_userにしてください。"
+                    "既存スキルなしで言語モデルだけで完了できる作業はno_skillにしてください。"
+                    "出力は有効なJSON objectだけにしてください。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _build_planning_prompt(issue, skills, tools),
+            },
+        ]
+        last_error: TaskPlanningError | None = None
+        for attempt in range(MAX_TASK_PLAN_ATTEMPTS):
+            response = self._llm.complete(messages)
+            try:
+                plan = parse_task_plan(response.content)
+                _validate_task_plan(plan, skills=skills, tools=tools)
+                return plan
+            except TaskPlanningError as exc:
+                last_error = exc
+                logger.warning(
+                    "タスク計画の形式が不正なため修正を要求します attempt=%s/%s error=%s",
+                    attempt + 1,
+                    MAX_TASK_PLAN_ATTEMPTS,
+                    exc,
+                )
+                if attempt == MAX_TASK_PLAN_ATTEMPTS - 1:
+                    break
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": response.content},
+                        {
+                            "role": "user",
+                            "content": _build_plan_retry_prompt(exc),
+                        },
+                    ]
+                )
+        raise TaskPlanningError(
+            f"task plan remained invalid after {MAX_TASK_PLAN_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
 
 class GenericTaskRunner:
@@ -242,11 +272,14 @@ class TaskOrchestrator:
             return _needs_user_result(
                 f"スキル `{plan.skill_name}` に必要なtoolが不足しています。\n理由: {exc}"
             )
-        runner = GenericSkillRunner(
-            skill=skill,
-            tools=tool_registry,
-            skill_agent=self._skill_agent,
-        )
+        if skill.runner is not None:
+            runner = ScriptedSkillRunner(skill=skill, tools=tool_registry)
+        else:
+            runner = GenericSkillRunner(
+                skill=skill,
+                tools=tool_registry,
+                skill_agent=self._skill_agent,
+            )
         task_input = dict(plan.task_input or {})
         if plan.target_url:
             task_input.setdefault("target_url", plan.target_url.strip())
@@ -271,13 +304,19 @@ def parse_task_plan(output: str) -> TaskPlan:
     reason = data.get("reason")
     if not isinstance(reason, str) or reason.strip() == "":
         raise TaskPlanningError("task plan missing reason")
-    skill_name = data.get("skill_name")
-    tool_names = data.get("tool_names", [])
-    target_url = data.get("target_url")
-    task_input = data.get("task_input")
-    user_request = data.get("user_request")
+    skill_name = _normalize_json_null(data.get("skill_name"))
+    tool_names = _normalize_json_null(data.get("tool_names", []))
+    target_url = _normalize_json_null(data.get("target_url"))
+    task_input = _normalize_json_null(data.get("task_input"))
+    user_request = _normalize_json_null(data.get("user_request"))
+    if skill_name is not None and not isinstance(skill_name, str):
+        raise TaskPlanningError("task plan skill_name must be a string or null")
+    if target_url is not None and not isinstance(target_url, str):
+        raise TaskPlanningError("task plan target_url must be a string or null")
     if task_input is not None and not isinstance(task_input, dict):
         raise TaskPlanningError("task plan task_input must be an object or null")
+    if user_request is not None and not isinstance(user_request, str):
+        raise TaskPlanningError("task plan user_request must be a string or null")
     if tool_names is None:
         parsed_tool_names: tuple[str, ...] = ()
     elif isinstance(tool_names, list) and all(isinstance(item, str) for item in tool_names):
@@ -292,6 +331,61 @@ def parse_task_plan(output: str) -> TaskPlan:
         target_url=target_url.strip() if isinstance(target_url, str) else None,
         task_input=task_input,
         user_request=user_request.strip() if isinstance(user_request, str) else None,
+    )
+
+
+def _normalize_json_null(value: Any) -> Any:
+    if isinstance(value, str) and value.strip().lower() == "null":
+        return None
+    return value
+
+
+def _validate_task_plan(
+    plan: TaskPlan,
+    *,
+    skills: list[Skill],
+    tools: list[dict[str, Any]],
+) -> None:
+    skill_names = {skill.name for skill in skills}
+    tool_names = {
+        name
+        for tool in tools
+        if isinstance((name := tool.get("name")), str) and name
+    }
+    if plan.decision == "use_skill":
+        if plan.skill_name is None:
+            raise TaskPlanningError("use_skill requires skill_name")
+        if plan.skill_name not in skill_names:
+            raise TaskPlanningError(f"use_skill referenced unknown skill: {plan.skill_name}")
+        if plan.tool_names:
+            raise TaskPlanningError("use_skill requires tool_names to be an empty array")
+        return
+    if plan.decision == "use_tools":
+        if plan.skill_name is not None:
+            raise TaskPlanningError("use_tools requires skill_name to be null")
+        if not plan.tool_names:
+            raise TaskPlanningError("use_tools requires at least one tool name")
+        unknown = [name for name in plan.tool_names if name not in tool_names]
+        if unknown:
+            raise TaskPlanningError(
+                f"use_tools referenced unknown tools: {', '.join(unknown)}"
+            )
+        return
+    if plan.skill_name is not None or plan.tool_names:
+        raise TaskPlanningError(
+            f"{plan.decision} requires skill_name=null and tool_names=[]"
+        )
+    if plan.decision == "needs_user" and not plan.user_request:
+        raise TaskPlanningError("needs_user requires a non-empty user_request")
+
+
+def _build_plan_retry_prompt(error: TaskPlanningError) -> str:
+    return (
+        "前回の出力は次の検証エラーにより無効です。\n"
+        f"- {error}\n\n"
+        "作業内容の判断は変えず、型と分岐の整合性だけを修正してください。\n"
+        "文字列の \"null\" ではなくJSON値の null を使用してください。\n"
+        "Markdownやコードフェンスを付けず、有効なJSON objectだけを返してください。"
     )
 
 
@@ -443,15 +537,24 @@ def _build_planning_prompt(
         "toolを1つまたは複数使えば依頼内容を過不足なく実行できる場合はuse_toolsを選んでください。\n"
         "toolを複数使うよりskillを使う方が依頼目的に近い場合だけuse_skillを選んでください。\n"
         "依頼されていない作業を含むスキルは選ばないでください。例えば「Webページ本文を取得して」だけなら、ブックマーク登録まで行うスキルは使わずfetch_web_pageだけを使ってください。\n"
-        "必ず次のJSONだけを返してください。\n"
-        "{"
-        '"decision": "use_skill|use_tools|no_skill|needs_user", '
-        '"skill_name": "使うスキル名またはnull", '
-        '"tool_names": ["使うtool名"], '
-        '"target_url": "対象URLなどスキルrunnerに渡す主要入力またはnull", '
-        '"task_input": "スキルに渡す追加入力objectまたはnull", '
-        '"reason": "判断理由", '
-        '"user_request": "ユーザーに求める追記・確認事項またはnull"'
+        "型規則:\n"
+        "- nullには引用符を付けず、JSON値のnullとして出力する。\n"
+        "- task_inputはJSON objectまたはnull。文字列は禁止。\n"
+        "- user_request、skill_name、target_urlは文字列またはnull。\n"
+        "- use_skillではskill_nameを指定し、tool_namesは必ず[]にする。\n"
+        "- use_toolsではskill_nameをnullにし、tool_namesを1件以上指定する。\n"
+        "- no_skillではskill_nameをnull、tool_namesを[]にする。\n"
+        "- needs_userではskill_nameをnull、tool_namesを[]にし、user_requestを指定する。\n"
+        "- Markdownやコードフェンスを付けず、JSON objectだけを出力する。\n\n"
+        "use_skillの有効な出力例:\n"
+        "{\n"
+        '  "decision": "use_skill",\n'
+        '  "skill_name": "web-briefing-bookmark",\n'
+        '  "tool_names": [],\n'
+        '  "target_url": "https://example.com/article",\n'
+        '  "task_input": null,\n'
+        '  "reason": "依頼目的がスキルと一致するため",\n'
+        '  "user_request": null\n'
         "}\n\n"
         f"利用可能なスキル:\n{json.dumps(skill_summaries, ensure_ascii=False)}\n\n"
         f"利用可能なtool:\n{json.dumps(tools, ensure_ascii=False)}\n\n"

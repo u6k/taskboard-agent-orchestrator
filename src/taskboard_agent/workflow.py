@@ -117,7 +117,12 @@ def run_once(
                     issue_id,
                     author_id,
                 )
-                redmine.update_issue(issue_id, notes=comment, assigned_to_id=author_id)
+                redmine.update_issue(
+                    issue_id,
+                    notes=comment,
+                    assigned_to_id=author_id,
+                    status_id=config.redmine_review_status_id,
+                )
             return RunResult(
                 status="agent_failed",
                 issue_id=issue_id,
@@ -202,7 +207,8 @@ def _apply_skill_event(
     comments: list[str],
     dry_run: bool,
 ) -> None:
-    comments.append(event.notes)
+    if event.notes is not None:
+        comments.append(event.notes)
     if dry_run:
         return
     if event.kind == "start":
@@ -212,7 +218,8 @@ def _apply_skill_event(
             status_id=config.redmine_in_progress_status_id,
         )
     elif event.kind == "progress":
-        redmine.update_issue(issue_id, notes=event.notes)
+        if event.notes is not None:
+            redmine.update_issue(issue_id, notes=event.notes)
     elif event.kind == "final_review":
         redmine.update_issue(
             issue_id,
@@ -221,7 +228,12 @@ def _apply_skill_event(
             status_id=config.redmine_review_status_id,
         )
     elif event.kind == "final_return":
-        redmine.update_issue(issue_id, notes=event.notes, assigned_to_id=author_id)
+        redmine.update_issue(
+            issue_id,
+            notes=event.notes,
+            assigned_to_id=author_id,
+            status_id=config.redmine_review_status_id,
+        )
 
 
 def _require_issue_id(issue_summary: dict[str, Any]) -> int:
