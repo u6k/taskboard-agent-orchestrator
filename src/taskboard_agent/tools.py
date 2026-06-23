@@ -19,6 +19,7 @@ class ToolSpec:
     description: str
     parameters: dict[str, Any]
     risk: ToolRisk = "read"
+    planner_visible: bool = True
 
     def as_litellm_tool(self) -> dict[str, Any]:
         return {

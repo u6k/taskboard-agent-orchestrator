@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -18,8 +19,10 @@ class RedmineClient:
         timeout: float = 30.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._base_parts = urlsplit(self._base_url)
         self._client = httpx.Client(
-            base_url=base_url.rstrip("/"),
+            base_url=self._base_url,
             headers={
                 "X-Redmine-API-Key": api_key,
                 "Accept": "application/json",
@@ -48,13 +51,65 @@ class RedmineClient:
     def get_issue(self, issue_id: int) -> dict[str, Any]:
         response = self._client.get(
             f"/issues/{issue_id}.json",
-            params={"include": "journals"},
+            params={"include": "journals,attachments"},
         )
         data = _json_or_raise(response, f"failed to fetch Redmine issue #{issue_id}")
         issue = data.get("issue")
         if not isinstance(issue, dict):
             raise RedmineError(f"failed to fetch Redmine issue #{issue_id}: missing issue")
         return issue
+
+    def download_attachment(
+        self,
+        content_url: str,
+        *,
+        max_bytes: int = 20 * 1024 * 1024,
+    ) -> bytes:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        url = urljoin(f"{self._base_url}/", content_url)
+        parts = urlsplit(url)
+        if (parts.scheme, parts.netloc) != (
+            self._base_parts.scheme,
+            self._base_parts.netloc,
+        ):
+            raise RedmineError("attachment URL must use the configured Redmine origin")
+        base_path = self._base_parts.path.rstrip("/")
+        if base_path and not (
+            parts.path == base_path or parts.path.startswith(f"{base_path}/")
+        ):
+            raise RedmineError("attachment URL must be under the configured Redmine path")
+
+        try:
+            with self._client.stream("GET", url) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise RedmineError(
+                        "failed to download Redmine attachment: "
+                        f"HTTP {response.status_code} {response.text}"
+                    )
+                content_length = response.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        declared_size = int(content_length)
+                    except ValueError:
+                        declared_size = None
+                    if declared_size is not None and declared_size > max_bytes:
+                        raise RedmineError(
+                            f"Redmine attachment exceeds {max_bytes} bytes"
+                        )
+                chunks: list[bytes] = []
+                size = 0
+                for chunk in response.iter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise RedmineError(
+                            f"Redmine attachment exceeds {max_bytes} bytes"
+                        )
+                    chunks.append(chunk)
+        except httpx.HTTPError as exc:
+            raise RedmineError(f"failed to download Redmine attachment: {exc}") from exc
+        return b"".join(chunks)
 
     def update_description_note_and_reassign(
         self,

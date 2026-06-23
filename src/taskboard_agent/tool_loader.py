@@ -50,6 +50,7 @@ class ToolScriptCatalog:
                 "risk": spec.risk,
             }
             for spec in self.specs()
+            if spec.planner_visible
         ]
 
     def specs(self) -> list[ToolSpec]:
