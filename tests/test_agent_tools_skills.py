@@ -161,6 +161,37 @@ def test_function_calling_agent_executes_tool_calls_until_final_response() -> No
     assert result.tool_results[0].content == {"text": "hello"}
 
 
+def test_function_calling_agent_can_return_immediately_after_selected_tool() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="echo",
+            description="Echo text.",
+            parameters={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        ),
+        lambda text: {"text": text},
+    )
+    llm = FakeLLM()
+
+    result = FunctionCallingAgent(llm=llm, tools=registry).run(
+        [{"role": "user", "content": "echo hello"}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "ignored", "strict": True, "schema": {"type": "object"}},
+        },
+        return_after_tool_names={"echo"},
+    )
+
+    assert llm.calls == 1
+    assert result.final_text == ""
+    assert result.stopped_reason == "tool_result"
+    assert result.tool_results[0].content == {"text": "hello"}
+
+
 def test_function_calling_agent_emits_intermediate_llm_response() -> None:
     registry = ToolRegistry()
     registry.register(

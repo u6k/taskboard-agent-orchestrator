@@ -54,6 +54,7 @@ class FunctionCallingAgent:
         approved_tools: set[str] | None = None,
         on_llm_response: Callable[[LLMResponse], None] | None = None,
         response_format: dict[str, Any] | None = None,
+        return_after_tool_names: set[str] | None = None,
     ) -> AgentRunResult:
         registry = tools or self._tools
         if registry is None:
@@ -117,6 +118,15 @@ class FunctionCallingAgent:
                         "name": tool_call.name,
                         "content": result.to_json(),
                     }
+                )
+            if return_after_tool_names and any(
+                result.name in return_after_tool_names for result in tool_results
+            ):
+                return AgentRunResult(
+                    final_text="",
+                    messages=tuple(working_messages),
+                    tool_results=tuple(tool_results),
+                    stopped_reason="tool_result",
                 )
 
         return AgentRunResult(

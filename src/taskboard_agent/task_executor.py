@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+import re
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal, Protocol
 
 from taskboard_agent.llm import LLMResponse
@@ -13,6 +14,7 @@ from taskboard_agent.skill_runtime import (
     SkillEventSink,
     SkillEvent,
     SkillExecutionResult,
+    _with_tool_artifacts,
     llm_response_events,
 )
 from taskboard_agent.skills import Skill, SkillRegistry
@@ -21,10 +23,11 @@ from taskboard_agent.structured_output import (
     task_plan_response_format,
     tool_execution_response_format,
 )
-from taskboard_agent.tools import ToolRegistry, ToolRegistryError
+from taskboard_agent.tools import ToolExecutionResult, ToolRegistry, ToolRegistryError
 
 
 PlanDecision = Literal["use_skill", "use_tools", "no_skill", "needs_user"]
+StepKind = Literal["skill", "tool", "llm", "unavailable"]
 GenericStatus = Literal["completed", "needs_user", "missing_tool"]
 MAX_TASK_PLAN_ATTEMPTS = 3
 logger = logging.getLogger(__name__)
@@ -55,6 +58,14 @@ class ToolCatalogPort(Protocol):
 
 
 @dataclass(frozen=True)
+class TaskStep:
+    kind: StepKind
+    purpose: str
+    name: str | None = None
+    arguments: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class TaskPlan:
     decision: PlanDecision
     reason: str
@@ -63,6 +74,8 @@ class TaskPlan:
     target_url: str | None = None
     task_input: dict[str, Any] | None = None
     user_request: str | None = None
+    steps: tuple[TaskStep, ...] = ()
+    limitations: tuple[str, ...] = ()
 
 
 class LiteLLMTaskPlanner:
@@ -86,6 +99,10 @@ class LiteLLMTaskPlanner:
                     "一致するスキルがなく、利用可能なtoolだけで依頼を過不足なく実行できる場合にuse_toolsにしてください。"
                     "依頼が曖昧、必要情報が不足、または必要なtool/skillが不足している場合はneeds_userにしてください。"
                     "既存スキルなしで言語モデルだけで完了できる作業はno_skillにしてください。"
+                    "ただし実行計画は必ず作業ステップに分解し、各ステップをskill/tool/llm/unavailableのいずれかに分類してください。"
+                    "専用toolやskillがない作業でも、LLMの推論・要約・分析・比較・提案・文章作成で進められる場合はllmステップとして計画してください。"
+                    "tool/skillステップのnameには、利用可能一覧にある機械名だけを正確に入れ、説明文や表示名を混ぜないでください。"
+                    "実行できないことはunavailableステップまたはlimitationsに明示し、それ以外の実行可能な作業は止めずに進める計画にしてください。"
                     "計画の出力構造はAPI側で指定されています。"
                 ),
             },
@@ -110,6 +127,7 @@ class LiteLLMTaskPlanner:
             )
             try:
                 plan = parse_task_plan(response.content)
+                plan = normalize_task_plan_names(plan, skills=skills, tools=tools)
                 _validate_task_plan(plan, skills=skills, tools=tools)
                 return plan
             except TaskPlanningError as exc:
@@ -233,12 +251,23 @@ class GenericToolsRunner:
             allow_writes=not dry_run,
             on_llm_response=record_llm_response,
             response_format=tool_execution_response_format(),
+            return_after_tool_names=_return_after_tool_names(tool_names),
         )
-        result = _parse_tool_execution(
-            agent_result.final_text,
-            tool_names=tool_names,
-            dry_run=dry_run,
-        )
+        try:
+            result = _parse_tool_execution(
+                agent_result.final_text,
+                tool_names=tool_names,
+                dry_run=dry_run,
+            )
+        except TaskPlanningError:
+            result = _fallback_tool_execution_from_artifacts(
+                agent_result.tool_results,
+                tool_names=tool_names,
+                dry_run=dry_run,
+            )
+            if result is None:
+                raise
+        result = _with_tool_artifacts(result, agent_result.tool_results)
         if emit_event is not None or not llm_events:
             return result
         return _insert_after_start(result, tuple(llm_events))
@@ -296,10 +325,25 @@ class TaskOrchestrator:
         announce_plan: bool = True,
         conversation_messages: list[dict[str, Any]] | None = None,
     ) -> SkillExecutionResult:
-        skills = self._skill_registry.list()
+        skills, tools = self.planning_catalog()
+        plan = normalize_task_plan_names(plan, skills=skills, tools=tools)
         execution_issue = dict(issue)
         if conversation_messages:
             execution_issue["conversation_context"] = conversation_messages
+        if plan.steps:
+            if emit_event is not None and announce_plan:
+                emit_event(_plan_start_event(plan))
+            result = self._execute_steps(
+                issue=execution_issue,
+                plan=plan,
+                dry_run=dry_run,
+                conversation_messages=conversation_messages,
+            )
+            if emit_event is not None:
+                return _drop_start_event(result)
+            if not announce_plan:
+                return _drop_start_event(result)
+            return _prepend_plan_event(result, _plan_notes(plan))
         if plan.decision == "needs_user":
             return _needs_user_result(plan.user_request or plan.reason)
         if plan.decision == "no_skill":
@@ -384,6 +428,324 @@ class TaskOrchestrator:
             return _drop_start_event(result)
         return _prepend_plan_event(result, _plan_notes(plan))
 
+    def _execute_steps(
+        self,
+        *,
+        issue: dict[str, Any],
+        plan: TaskPlan,
+        dry_run: bool,
+        conversation_messages: list[dict[str, Any]] | None,
+    ) -> SkillExecutionResult:
+        events: list[SkillEvent] = [SkillEvent("start", "作業を開始します。")]
+        artifacts: list[dict[str, Any]] = []
+        status = "dry_run" if dry_run else "processed"
+        step_context = list(conversation_messages or [])
+        step_context.append(
+            {
+                "role": "user",
+                "content": (
+                    "Redmineチケットの依頼内容:\n"
+                    f"{json.dumps(_issue_context(issue), ensure_ascii=False)}"
+                ),
+            }
+        )
+
+        for index, step in enumerate(plan.steps, 1):
+            if step.kind == "unavailable":
+                events.append(
+                    SkillEvent(
+                        "progress",
+                        f"未実行の作業 {index}: {step.purpose}",
+                    )
+                )
+                continue
+            try:
+                if step.kind == "llm":
+                    result = self._run_llm_step(
+                        issue=issue,
+                        step=step,
+                        plan=plan,
+                        dry_run=dry_run,
+                        step_context=step_context,
+                    )
+                elif step.kind == "tool":
+                    result = self._run_tool_step(
+                        issue=issue,
+                        step=step,
+                        plan=plan,
+                        dry_run=dry_run,
+                        step_context=step_context,
+                    )
+                else:
+                    result = self._run_skill_step(issue=issue, step=step, dry_run=dry_run)
+            except Exception as exc:
+                result = _step_exception_result(step, exc, dry_run=dry_run)
+
+            if result.status in ("failed", "missing_tool", "needs_user"):
+                result = self._recover_step_failure(
+                    issue=issue,
+                    step=step,
+                    plan=plan,
+                    dry_run=dry_run,
+                    step_context=step_context,
+                    failed_result=result,
+                )
+
+            events.extend(_step_events(index, step, result))
+            artifacts.extend(result.artifacts)
+            step_context.extend(_result_context_messages(index, step, result))
+            if result.status in ("failed", "missing_tool"):
+                status = result.status
+                break
+            if result.status == "needs_user":
+                status = "needs_user"
+                break
+
+        final_notes = _step_final_notes(plan=plan, status=status)
+        if status in ("failed",):
+            events.append(SkillEvent("final_return", final_notes))
+        else:
+            events.append(SkillEvent("final_review", final_notes))
+        return SkillExecutionResult(
+            status=status,
+            events=tuple(events),
+            artifacts=tuple(artifacts),
+            dry_run=dry_run,
+        )
+
+    def _run_tool_step(
+        self,
+        *,
+        issue: dict[str, Any],
+        step: TaskStep,
+        plan: TaskPlan,
+        dry_run: bool,
+        step_context: list[dict[str, Any]],
+    ) -> SkillExecutionResult:
+        if not step.name:
+            return _missing_step_name_result("tool", step)
+        try:
+            tool_registry = self._tool_catalog.registry_for((step.name,))
+        except (ToolRegistryError, RuntimeError) as exc:
+            return _needs_user_result(f"必要なtool `{step.name}` が不足しています。\n理由: {exc}")
+        arguments, repair_events = _repair_tool_step_arguments(
+            tool_registry=tool_registry,
+            step=step,
+            plan=plan,
+            issue=issue,
+            step_context=step_context,
+        )
+        try:
+            tool_result = tool_registry.execute(
+                step.name,
+                arguments,
+                allow_writes=not dry_run,
+            )
+        except (ToolRegistryError, RuntimeError) as exc:
+            return SkillExecutionResult(
+                status="failed",
+                events=(SkillEvent("final_return", f"tool `{step.name}` の実行に失敗しました。\n理由: {exc}"),),
+                dry_run=dry_run,
+            )
+        result = _fallback_tool_execution_from_artifacts(
+            (tool_result,),
+            tool_names=(step.name,),
+            dry_run=dry_run,
+        )
+        if result is None:
+            result = _tool_result_execution(tool_result, dry_run=dry_run)
+        if repair_events:
+            result = _insert_after_start(result, tuple(repair_events))
+        return _with_tool_artifacts(result, (tool_result,))
+
+    def _run_skill_step(
+        self,
+        *,
+        issue: dict[str, Any],
+        step: TaskStep,
+        dry_run: bool,
+    ) -> SkillExecutionResult:
+        if not step.name:
+            return _missing_step_name_result("skill", step)
+        skills = {skill.name: skill for skill in self._skill_registry.list()}
+        skill = skills.get(step.name)
+        if skill is None:
+            return _needs_user_result(f"必要なスキル `{step.name}` が登録されていません。")
+        try:
+            tool_registry = self._tool_catalog.registry_for(skill.required_tools)
+        except (ToolRegistryError, RuntimeError) as exc:
+            return _needs_user_result(f"スキル `{step.name}` に必要なtoolが不足しています。\n理由: {exc}")
+        runner = (
+            ScriptedSkillRunner(skill=skill, tools=tool_registry)
+            if skill.runner is not None
+            else GenericSkillRunner(
+                skill=skill,
+                tools=tool_registry,
+                skill_agent=self._skill_agent,
+            )
+        )
+        return runner.run(
+            issue=issue,
+            task_input=step.arguments or {},
+            dry_run=dry_run,
+        )
+
+    def _run_llm_step(
+        self,
+        *,
+        issue: dict[str, Any],
+        step: TaskStep,
+        plan: TaskPlan,
+        dry_run: bool,
+        step_context: list[dict[str, Any]],
+    ) -> SkillExecutionResult:
+        return self._generic_runner.run(
+            issue=issue,
+            dry_run=dry_run,
+            conversation_messages=[
+                *step_context,
+                {
+                    "role": "user",
+                    "content": (
+                        "次の作業ステップをLLMで実行してください。\n"
+                        f"ステップ目的: {step.purpose}\n"
+                        f"補足引数: {json.dumps(step.arguments or {}, ensure_ascii=False)}"
+                    ),
+                },
+            ],
+            task_plan=TaskPlan(
+                decision="no_skill",
+                reason=step.purpose,
+                task_input={"instruction": step.purpose},
+                limitations=plan.limitations,
+            ),
+        )
+
+    def _recover_step_failure(
+        self,
+        *,
+        issue: dict[str, Any],
+        step: TaskStep,
+        plan: TaskPlan,
+        dry_run: bool,
+        step_context: list[dict[str, Any]],
+        failed_result: SkillExecutionResult,
+    ) -> SkillExecutionResult:
+        analysis_event = SkillEvent(
+            "progress",
+            (
+                "ステップの失敗原因を確認します。\n"
+                f"対象: {step.kind} {step.name or ''}\n"
+                f"失敗内容:\n{_event_notes(failed_result.events)}"
+            ),
+        )
+        if step.kind != "tool":
+            return _append_events(
+                failed_result,
+                (
+                    analysis_event,
+                    SkillEvent(
+                        "progress",
+                        "このステップは自動で再実行できる修正方法を特定できませんでした。",
+                    ),
+                ),
+            )
+
+        retry_result = self._retry_tool_step_after_failure(
+            issue=issue,
+            step=step,
+            plan=plan,
+            dry_run=dry_run,
+            step_context=step_context,
+            failed_result=failed_result,
+        )
+        if retry_result is None:
+            return _append_events(
+                failed_result,
+                (
+                    analysis_event,
+                    SkillEvent(
+                        "progress",
+                        "toolスキーマと文脈を確認しましたが、自動補正できる引数変更を特定できませんでした。",
+                    ),
+                ),
+            )
+        return _merge_recovery_result(
+            failed_result,
+            (
+                analysis_event,
+                SkillEvent("progress", "失敗原因を踏まえて引数を補正し、toolを再実行します。"),
+            ),
+            retry_result,
+        )
+
+    def _retry_tool_step_after_failure(
+        self,
+        *,
+        issue: dict[str, Any],
+        step: TaskStep,
+        plan: TaskPlan,
+        dry_run: bool,
+        step_context: list[dict[str, Any]],
+        failed_result: SkillExecutionResult,
+    ) -> SkillExecutionResult | None:
+        if not step.name:
+            return None
+        try:
+            tool_registry = self._tool_catalog.registry_for((step.name,))
+        except (ToolRegistryError, RuntimeError):
+            return None
+        repaired_context = [
+            *step_context,
+            {
+                "role": "assistant",
+                "content": f"直前の失敗内容:\n{_event_notes(failed_result.events)}",
+            },
+        ]
+        arguments, repair_events = _repair_tool_step_arguments(
+            tool_registry=tool_registry,
+            step=step,
+            plan=plan,
+            issue=issue,
+            step_context=repaired_context,
+        )
+        arguments, schema_events = _normalize_tool_arguments_for_schema(
+            tool_registry=tool_registry,
+            tool_name=step.name,
+            arguments=arguments,
+        )
+        if arguments == (step.arguments or {}):
+            return None
+        try:
+            tool_result = tool_registry.execute(
+                step.name,
+                arguments,
+                allow_writes=not dry_run,
+            )
+        except (ToolRegistryError, RuntimeError) as exc:
+            return SkillExecutionResult(
+                status="failed",
+                events=(
+                    *repair_events,
+                    *schema_events,
+                    SkillEvent(
+                        "final_return",
+                        f"補正後もtool `{step.name}` の実行に失敗しました。\n理由: {exc}",
+                    ),
+                ),
+                dry_run=dry_run,
+            )
+        result = _fallback_tool_execution_from_artifacts(
+            (tool_result,),
+            tool_names=(step.name,),
+            dry_run=dry_run,
+        )
+        if result is None:
+            result = _tool_result_execution(tool_result, dry_run=dry_run)
+        if repair_events or schema_events:
+            result = _insert_after_start(result, (*repair_events, *schema_events))
+        return _with_tool_artifacts(result, (tool_result,))
+
 
 def parse_task_plan(output: str) -> TaskPlan:
     data = _loads_object(output, "task plan")
@@ -398,6 +760,8 @@ def parse_task_plan(output: str) -> TaskPlan:
     target_url = _normalize_json_null(data.get("target_url"))
     task_input = _normalize_json_null(data.get("task_input"))
     user_request = _normalize_json_null(data.get("user_request"))
+    steps = _parse_task_steps(_normalize_json_null(data.get("steps", [])))
+    limitations = _parse_string_tuple(data.get("limitations", []), "limitations")
     if skill_name is not None and not isinstance(skill_name, str):
         raise TaskPlanningError("task plan skill_name must be a string or null")
     if target_url is not None and not isinstance(target_url, str):
@@ -420,7 +784,337 @@ def parse_task_plan(output: str) -> TaskPlan:
         target_url=target_url.strip() if isinstance(target_url, str) else None,
         task_input=task_input,
         user_request=user_request.strip() if isinstance(user_request, str) else None,
+        steps=steps,
+        limitations=limitations,
     )
+
+
+def normalize_task_plan_names(
+    plan: TaskPlan,
+    *,
+    skills: list[Skill],
+    tools: list[dict[str, Any]],
+) -> TaskPlan:
+    skill_names = {skill.name for skill in skills}
+    tool_names = {
+        name
+        for tool in tools
+        if isinstance((name := tool.get("name")), str) and name
+    }
+    skill_name = _canonical_catalog_name(plan.skill_name, skill_names)
+    normalized_tool_names = tuple(
+        name
+        for tool_name in plan.tool_names
+        if (name := _canonical_catalog_name(tool_name, tool_names)) is not None
+    )
+    normalized_steps = tuple(
+        _normalize_step_name(step, skill_names=skill_names, tool_names=tool_names)
+        for step in plan.steps
+    )
+    if (
+        skill_name == plan.skill_name
+        and normalized_tool_names == plan.tool_names
+        and normalized_steps == plan.steps
+    ):
+        return plan
+    return replace(
+        plan,
+        skill_name=skill_name,
+        tool_names=normalized_tool_names,
+        steps=normalized_steps,
+    )
+
+
+def _normalize_step_name(
+    step: TaskStep,
+    *,
+    skill_names: set[str],
+    tool_names: set[str],
+) -> TaskStep:
+    if step.kind == "skill":
+        name = _canonical_catalog_name(step.name, skill_names)
+    elif step.kind == "tool":
+        name = _canonical_catalog_name(step.name, tool_names)
+    else:
+        name = step.name
+    return step if name == step.name else replace(step, name=name)
+
+
+def _canonical_catalog_name(value: str | None, catalog_names: set[str]) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if text in catalog_names:
+        return text
+    matches = [
+        name
+        for name in catalog_names
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return text
+
+
+def _repair_tool_step_arguments(
+    *,
+    tool_registry: ToolRegistry,
+    step: TaskStep,
+    plan: TaskPlan,
+    issue: dict[str, Any],
+    step_context: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[SkillEvent]]:
+    arguments = dict(step.arguments or {})
+    spec = next((item for item in tool_registry.specs() if item.name == step.name), None)
+    if spec is None:
+        return arguments, []
+    required = spec.parameters.get("required")
+    properties = spec.parameters.get("properties")
+    if not isinstance(required, list) or not isinstance(properties, dict):
+        return arguments, []
+
+    events: list[SkillEvent] = []
+    for field in required:
+        if not isinstance(field, str) or field in arguments:
+            continue
+        property_schema = properties.get(field)
+        if field == "query" and _schema_accepts_string(property_schema):
+            query = _infer_query_argument(
+                step=step,
+                plan=plan,
+                issue=issue,
+                step_context=step_context,
+            )
+            if query:
+                arguments[field] = query
+                events.append(
+                    SkillEvent(
+                        "progress",
+                        f"tool `{step.name}` の不足引数 `{field}` を文脈から補完しました: {query}",
+                    )
+                )
+    return arguments, events
+
+
+def _normalize_tool_arguments_for_schema(
+    *,
+    tool_registry: ToolRegistry,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], list[SkillEvent]]:
+    spec = next((item for item in tool_registry.specs() if item.name == tool_name), None)
+    if spec is None:
+        return arguments, []
+    properties = spec.parameters.get("properties")
+    if not isinstance(properties, dict):
+        return arguments, []
+
+    normalized = dict(arguments)
+    events: list[SkillEvent] = []
+    if spec.parameters.get("additionalProperties", True) is False:
+        unknown = [key for key in normalized if key not in properties]
+        for key in unknown:
+            normalized.pop(key, None)
+        if unknown:
+            events.append(
+                SkillEvent(
+                    "progress",
+                    f"tool `{tool_name}` のスキーマにない引数を除去しました: {', '.join(unknown)}",
+                )
+            )
+
+    for key, value in list(normalized.items()):
+        property_schema = properties.get(key)
+        if not isinstance(property_schema, dict):
+            continue
+        coerced = _coerce_schema_value(value, property_schema.get("type"))
+        if coerced is not _NO_COERCION and coerced != value:
+            normalized[key] = coerced
+            events.append(
+                SkillEvent(
+                    "progress",
+                    f"tool `{tool_name}` の引数 `{key}` の型を補正しました。",
+                )
+            )
+    return normalized, events
+
+
+_NO_COERCION = object()
+
+
+def _coerce_schema_value(value: Any, expected: Any) -> Any:
+    if expected is None:
+        return _NO_COERCION
+    expected_types = expected if isinstance(expected, list) else [expected]
+    if "string" in expected_types and not isinstance(value, str):
+        return str(value)
+    if "integer" in expected_types and isinstance(value, str):
+        stripped = value.strip()
+        if re.fullmatch(r"[+-]?\d+", stripped):
+            return int(stripped)
+    if "number" in expected_types and isinstance(value, str):
+        stripped = value.strip()
+        if re.fullmatch(r"[+-]?(?:\d+\.?\d*|\.\d+)", stripped):
+            return float(stripped)
+    if "boolean" in expected_types and isinstance(value, str):
+        stripped = value.strip().lower()
+        if stripped in ("true", "yes", "1"):
+            return True
+        if stripped in ("false", "no", "0"):
+            return False
+    return _NO_COERCION
+
+
+def _schema_accepts_string(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return True
+    expected = schema.get("type")
+    if expected is None:
+        return True
+    expected_types = expected if isinstance(expected, list) else [expected]
+    return "string" in expected_types
+
+
+def _infer_query_argument(
+    *,
+    step: TaskStep,
+    plan: TaskPlan,
+    issue: dict[str, Any],
+    step_context: list[dict[str, Any]],
+) -> str | None:
+    for value in _argument_alias_values(step.arguments):
+        if query := _clean_query_candidate(value):
+            return query
+    for source in _query_context_sources(
+        step=step,
+        plan=plan,
+        issue=issue,
+        step_context=step_context,
+    ):
+        if query := _extract_search_query(source):
+            return query
+    return None
+
+
+def _argument_alias_values(arguments: dict[str, Any] | None) -> list[Any]:
+    if not isinstance(arguments, dict):
+        return []
+    aliases = ("query", "search_query", "keyword", "keywords", "q", "term")
+    return [arguments[key] for key in aliases if key in arguments]
+
+
+def _query_context_sources(
+    *,
+    step: TaskStep,
+    plan: TaskPlan,
+    issue: dict[str, Any],
+    step_context: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    for message in reversed(step_context):
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            sources.append(content)
+    sources.extend(
+        item
+        for item in (
+            step.purpose,
+            plan.reason,
+            plan.user_request,
+            _task_input_text(plan.task_input),
+            str(issue.get("subject") or ""),
+            str(issue.get("description") or ""),
+            json.dumps(issue.get("conversation_context"), ensure_ascii=False),
+        )
+        if isinstance(item, str) and item.strip()
+    )
+    return sources
+
+
+def _task_input_text(task_input: dict[str, Any] | None) -> str:
+    if not isinstance(task_input, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("query", "search_query", "keyword", "keywords", "instruction", "target_url"):
+        value = task_input.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _extract_search_query(text: str) -> str | None:
+    for pattern in (
+        r"(?:検索キーワード|検索語|検索ワード|キーワード|query)\s*(?:[は:：=]|として|に)?\s*[「『\"`]([^」』\"`\n。]+)[」』\"`]",
+        r"[「『\"`]([^」』\"`\n]{2,80})[」』\"`]\s*(?:を用いて|で|について)?\s*(?:Web検索|検索|調査)",
+        r"(?:検索キーワード|検索語|検索ワード|キーワード|query)\s*(?:[は:：=]|として|に)\s*([^」』\"`\n。]+)",
+        r"(?:Web検索|検索|調査)\s*(?:する|を実行する|します)?\s*(?:キーワード|対象)?\s*[「『\"`]?([^」』\"`\n。]+)",
+        r"([^。\n]{2,80})\s*を(?:Web検索|検索|調査)(?:する|します|してください|して)?",
+    ):
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            if query := _clean_query_candidate(match.group(1)):
+                return query
+    return None
+
+
+def _clean_query_candidate(value: Any) -> str | None:
+    if isinstance(value, list):
+        value = " ".join(str(item) for item in value if str(item).strip())
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    candidate = candidate.strip(" \t\r\n:：=「」『』\"'`")
+    candidate = re.sub(r"\s+", " ", candidate)
+    candidate = re.sub(r"(?:を)?(?:Web検索|検索|調査)(?:する|します|してください)?$", "", candidate).strip()
+    candidate = candidate.strip(" \t\r\n:：=「」『』\"'`")
+    if not candidate or len(candidate) > 120:
+        return None
+    if candidate in {"web_search_pages", "Web検索", "検索", "調査"}:
+        return None
+    if re.fullmatch(r".*(?:準備|選定|決定|実行|取得|収集)(?:する|します)?", candidate):
+        return None
+    if "web_search_pages" in candidate:
+        return None
+    return candidate
+
+
+def _parse_task_steps(value: Any) -> tuple[TaskStep, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise TaskPlanningError("task plan steps must be an array")
+    steps: list[TaskStep] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise TaskPlanningError("task plan step must be an object")
+        kind = item.get("kind")
+        if kind not in ("skill", "tool", "llm", "unavailable"):
+            raise TaskPlanningError("task plan step missing valid kind")
+        purpose = item.get("purpose")
+        if not isinstance(purpose, str) or not purpose.strip():
+            raise TaskPlanningError("task plan step missing purpose")
+        name = _normalize_json_null(item.get("name"))
+        if name is not None and not isinstance(name, str):
+            raise TaskPlanningError("task plan step name must be a string or null")
+        arguments = _normalize_json_null(item.get("arguments"))
+        if arguments is not None and not isinstance(arguments, dict):
+            raise TaskPlanningError("task plan step arguments must be an object or null")
+        steps.append(
+            TaskStep(
+                kind=kind,
+                purpose=purpose.strip(),
+                name=name.strip() if isinstance(name, str) else None,
+                arguments=arguments,
+            )
+        )
+    return tuple(steps)
+
+
+def _parse_string_tuple(value: Any, label: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise TaskPlanningError(f"task plan {label} must be a string array")
+    return tuple(item.strip() for item in value if item.strip())
 
 
 def _normalize_json_null(value: Any) -> Any:
@@ -441,6 +1135,15 @@ def _validate_task_plan(
         for tool in tools
         if isinstance((name := tool.get("name")), str) and name
     }
+    if plan.steps:
+        for step in plan.steps:
+            if step.kind == "skill" and step.name not in skill_names:
+                raise TaskPlanningError(f"step referenced unknown skill: {step.name}")
+            if step.kind == "tool" and step.name not in tool_names:
+                raise TaskPlanningError(f"step referenced unknown tool: {step.name}")
+            if step.kind in ("skill", "tool") and not step.name:
+                raise TaskPlanningError(f"{step.kind} step requires name")
+        return
     if plan.decision == "use_skill":
         if plan.skill_name is None:
             raise TaskPlanningError("use_skill requires skill_name")
@@ -532,6 +1235,206 @@ def _parse_generic_execution(output: str, *, dry_run: bool) -> SkillExecutionRes
     )
 
 
+def _tool_result_execution(
+    tool_result: ToolExecutionResult,
+    *,
+    dry_run: bool,
+) -> SkillExecutionResult:
+    content = tool_result.content
+    ok = content.get("ok")
+    if ok is False:
+        status = "failed"
+        event = SkillEvent(
+            "final_return",
+            f"tool `{tool_result.name}` の実行に失敗しました。\n理由: {content.get('error') or '不明なエラー'}",
+        )
+    else:
+        status = "dry_run" if dry_run else "processed"
+        event = SkillEvent(
+            "final_review",
+            f"tool `{tool_result.name}` を実行しました。\n結果:\n{json.dumps(content, ensure_ascii=False)}",
+        )
+    return SkillExecutionResult(
+        status=status,
+        events=(
+            SkillEvent("start", "作業を開始します。"),
+            SkillEvent("progress", f"toolを実行しました: {tool_result.name}"),
+            event,
+        ),
+        dry_run=dry_run,
+    )
+
+
+def _fallback_tool_execution_from_artifacts(
+    tool_results: tuple[Any, ...],
+    *,
+    tool_names: tuple[str, ...],
+    dry_run: bool,
+) -> SkillExecutionResult | None:
+    for result in tool_results:
+        content = getattr(result, "content", None)
+        if not isinstance(content, dict):
+            continue
+        if getattr(result, "name", None) == "web_search_pages" and content.get("ok") is False:
+            error = content.get("error") or "不明なエラー"
+            return SkillExecutionResult(
+                status="failed",
+                events=(
+                    SkillEvent("start", "作業を開始します。"),
+                    SkillEvent("progress", f"toolを実行しました: {', '.join(tool_names)}"),
+                    SkillEvent("final_return", f"Web検索に失敗しました。\n理由: {error}"),
+                ),
+                dry_run=dry_run,
+            )
+        artifact = content.get("context_artifact")
+        if isinstance(artifact, dict) and artifact.get("type") == "web_search_pages":
+            status = "dry_run" if dry_run else "processed"
+            return SkillExecutionResult(
+                status=status,
+                events=(
+                    SkillEvent("start", "作業を開始します。"),
+                    SkillEvent("progress", f"toolを実行しました: {', '.join(tool_names)}"),
+                    SkillEvent(
+                        "final_review",
+                        (
+                            "tool実行後の最終JSON生成が空または不正だったため、"
+                            "取得済みの検索結果から報告を作成しました。"
+                        ),
+                    ),
+                ),
+                dry_run=dry_run,
+            )
+    return None
+
+
+def _missing_step_name_result(kind: str, step: TaskStep) -> SkillExecutionResult:
+    return SkillExecutionResult(
+        status="missing_tool",
+        events=(
+            SkillEvent(
+                "final_review",
+                f"{kind}ステップの実行対象名が不足しています。\nステップ: {step.purpose}",
+            ),
+        ),
+    )
+
+
+def _step_exception_result(
+    step: TaskStep,
+    exc: Exception,
+    *,
+    dry_run: bool,
+) -> SkillExecutionResult:
+    return SkillExecutionResult(
+        status="failed",
+        events=(
+            SkillEvent(
+                "final_return",
+                f"{step.kind}ステップの実行中に例外が発生しました。\n理由: {exc}",
+            ),
+        ),
+        dry_run=dry_run,
+    )
+
+
+def _append_events(
+    result: SkillExecutionResult,
+    events: tuple[SkillEvent, ...],
+) -> SkillExecutionResult:
+    return SkillExecutionResult(
+        status=result.status,
+        events=(*result.events, *events),
+        target_url=result.target_url,
+        page_title=result.page_title,
+        briefing=result.briefing,
+        bookmark_url=result.bookmark_url,
+        bookmark_payload=result.bookmark_payload,
+        artifacts=result.artifacts,
+        dry_run=result.dry_run,
+    )
+
+
+def _merge_recovery_result(
+    failed_result: SkillExecutionResult,
+    recovery_events: tuple[SkillEvent, ...],
+    retry_result: SkillExecutionResult,
+) -> SkillExecutionResult:
+    retry_events = tuple(
+        event for event in retry_result.events if event.kind != "start"
+    )
+    return SkillExecutionResult(
+        status=retry_result.status,
+        events=(*failed_result.events, *recovery_events, *retry_events),
+        target_url=retry_result.target_url,
+        page_title=retry_result.page_title,
+        briefing=retry_result.briefing,
+        bookmark_url=retry_result.bookmark_url,
+        bookmark_payload=retry_result.bookmark_payload,
+        artifacts=retry_result.artifacts,
+        dry_run=retry_result.dry_run,
+    )
+
+
+def _step_events(
+    index: int,
+    step: TaskStep,
+    result: SkillExecutionResult,
+) -> tuple[SkillEvent, ...]:
+    events = [SkillEvent("progress", f"ステップ {index} を実行しました: {step.purpose}")]
+    for event in result.events:
+        if event.kind == "start":
+            continue
+        events.append(event)
+    return tuple(events)
+
+
+def _result_context_messages(
+    index: int,
+    step: TaskStep,
+    result: SkillExecutionResult,
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": (
+                f"ステップ {index} 実行結果:\n"
+                f"目的: {step.purpose}\n"
+                f"状態: {result.status}\n"
+                f"報告:\n{_event_notes(result.events)}"
+            ),
+        }
+    ]
+    for artifact in result.artifacts:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": f"ステップ {index} 成果JSON:\n{json.dumps(artifact, ensure_ascii=False)}",
+            }
+        )
+    return messages
+
+
+def _event_notes(events: tuple[SkillEvent, ...]) -> str:
+    notes = [event.notes for event in events if event.notes]
+    return "\n\n".join(notes) if notes else "(なし)"
+
+
+def _step_final_notes(*, plan: TaskPlan, status: str) -> str:
+    lines = ["計画した作業ステップの実行を終了しました。"]
+    if plan.limitations:
+        lines.append("\n実行できないこと・未確認事項:")
+        lines.extend(f"- {item}" for item in plan.limitations)
+    if status in ("failed", "missing_tool", "needs_user"):
+        lines.append(f"\n終了状態: {status}")
+    return "\n".join(lines)
+
+
+def _return_after_tool_names(tool_names: tuple[str, ...]) -> set[str] | None:
+    if "web_search_pages" in tool_names:
+        return {"web_search_pages"}
+    return None
+
+
 def _needs_user_result(notes: str) -> SkillExecutionResult:
     return SkillExecutionResult(
         status="needs_user",
@@ -556,6 +1459,7 @@ def _prepend_plan_event(
         briefing=result.briefing,
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
+        artifacts=result.artifacts,
         dry_run=result.dry_run,
     )
 
@@ -574,6 +1478,7 @@ def _drop_start_event(result: SkillExecutionResult) -> SkillExecutionResult:
         briefing=result.briefing,
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
+        artifacts=result.artifacts,
         dry_run=result.dry_run,
     )
 
@@ -593,6 +1498,7 @@ def _insert_after_start(
         briefing=result.briefing,
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
+        artifacts=result.artifacts,
         dry_run=result.dry_run,
     )
 
@@ -607,10 +1513,22 @@ def _plan_notes(plan: TaskPlan) -> str:
         method = "専用スキルや外部toolは使わず、チケット本文から実行できる範囲で進めます。"
     else:
         method = "確認できた内容に沿って進めます。"
-    return (
+    notes = (
         f"ユーザーから依頼された作業は、{target}だと理解しました。"
         f"{plan.reason}と判断したためです。{method}"
     )
+    if plan.steps:
+        step_lines = [
+            f"{index}. {step.kind}: {step.purpose}"
+            for index, step in enumerate(plan.steps, 1)
+        ]
+        notes = f"{notes}\n\n作業ステップ:\n" + "\n".join(step_lines)
+    if plan.limitations:
+        notes = (
+            f"{notes}\n\n実行できないこと・未確認事項:\n"
+            + "\n".join(f"- {item}" for item in plan.limitations)
+        )
+    return notes
 
 
 def _build_planning_prompt(
@@ -626,12 +1544,26 @@ def _build_planning_prompt(
         "チケットに登録済みskill名が明記され、そのskillが依頼内容と整合する場合はuse_skillで選んでください。\n"
         "依頼目的全体と一致するskillがある場合は、内部toolを個別に組み合わせずuse_skillを選んでください。\n"
         "一致するskillがなく、toolだけで依頼を過不足なく実行できる場合にuse_toolsを選んでください。\n"
+        "ただし、ユーザー依頼は必ずstepsへ作業ステップとして分解してください。"
+        "各ステップは kind=skill/tool/llm/unavailable のいずれかにします。"
+        "検索・取得・抽出などはtool、登録済み手順に合うものはskill、要約・分類・比較・分析・提案・判断・文章作成はllmにしてください。"
+        "toolやskillがないことを理由に、LLMで進められる工程を未対応扱いしないでください。"
+        "どうしても実行できない工程だけunavailableにし、limitationsにも理由を書いてください。\n"
         "依頼されていない作業を含むスキルは選ばないでください。例えば「Webページ本文を取得して」だけなら、ブックマーク登録まで行うスキルは使わずfetch_web_pageだけを使ってください。\n"
         "分岐規則:\n"
         "- use_skillではskill_nameを指定し、tool_namesは必ず[]にする。\n"
         "- use_toolsではskill_nameをnullにし、tool_namesを1件以上指定する。\n"
         "- no_skillではskill_nameをnull、tool_namesを[]にする。\n"
         "- needs_userではskill_nameをnull、tool_namesを[]にし、user_requestを指定する。\n"
+        "steps/limitations規則:\n"
+        "- stepsには作業順にステップを入れる。実行可能な部分を省略しない。\n"
+        "- toolステップはnameに利用可能なtoolのnameを正確に入れる。説明文、表示名、括弧付き表記を混ぜない。\n"
+        "- skillステップはnameに利用可能なskillのnameを正確に入れる。説明文、表示名、括弧付き表記を混ぜない。\n"
+        "- ユーザーが `web_search_pages` のようなtool名を明示した場合、nameにはその文字列だけを入れる。\n"
+        "- argumentsには実行引数を入れる。\n"
+        "- llmステップはname=null、purposeにLLMで行う作業を具体的に入れる。\n"
+        "- unavailableステップはname=null、purposeに実行できない作業と理由を入れる。\n"
+        "- limitationsには未確認事項、外部制約、実行できないことを短く列挙する。\n"
         "task_inputは補足指示が必要な場合だけinstructionとtarget_urlを設定してください。\n"
         "出力構造と型はAPI側で指定されています。\n\n"
         f"利用可能なスキル:\n{json.dumps(skill_summaries, ensure_ascii=False)}\n\n"
@@ -655,6 +1587,8 @@ def _build_tool_messages(
                 "指定されたfunction toolsだけを使い、依頼された範囲を過不足なく実行してください。"
                 "依頼されていない追加作業は行わないでください。"
                 "tool結果のok=falseは失敗として扱い、必要なら追加作業を止めてユーザー確認を求めてください。"
+                "`web_search_pages`を使った場合は、検索結果一覧と各URLの本文取得ステータス"
+                "（正常またはエラー、エラー理由）を最終報告に必ず含めてください。"
                 "最終的な作業状態とRedmine向け報告を返してください。出力構造はAPI側で指定されています。"
             ),
         },

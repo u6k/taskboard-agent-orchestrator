@@ -25,6 +25,7 @@ from taskboard_agent.task_executor import (
 )
 from taskboard_agent.ticket_graph import TicketConversationGraph
 from taskboard_agent.tool_loader import ToolRuntimeContext, ToolScriptCatalog
+from taskboard_agent.web_search import DuckDuckGoSearchClient, WebSearchError
 from taskboard_agent.workflow import WorkflowError, run_once
 
 
@@ -83,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         redmine = RedmineClient(config.redmine_url, config.redmine_api_key)
         llm = LiteLLMClient(model=config.llm_model)
         page_fetcher = WebPageExtractor()
+        search_client = DuckDuckGoSearchClient()
         bookmark_client = LinkAceClient(config.linkace_url, config.linkace_api_key)
         skill_registry = SkillRegistry(Path("skills"))
         skill_agent = FunctionCallingAgent(llm=llm)
@@ -92,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
                 services={
                     "llm": llm,
                     "page_fetcher": page_fetcher,
+                    "search_client": search_client,
                     "bookmark_client": bookmark_client,
                     "redmine_client": redmine,
                 },
@@ -138,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         RedmineError,
         SkillRegistryError,
         TaskPlanningError,
+        WebSearchError,
         WorkflowError,
     ) as exc:
         with log_trace("run-once"):
