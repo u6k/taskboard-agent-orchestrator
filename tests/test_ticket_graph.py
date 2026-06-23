@@ -9,7 +9,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from taskboard_agent.llm import LLMResponse
 from taskboard_agent.skill_runtime import SkillEvent, SkillExecutionResult
-from taskboard_agent.task_executor import TaskPlan
+from taskboard_agent.task_executor import TaskPlan, TaskStep
 from taskboard_agent.ticket_graph import TicketConversationGraph
 
 
@@ -24,15 +24,23 @@ class FakeLLM:
 
 
 class FakeOrchestrator:
-    def __init__(self, *, fail_revision_once: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_revision_once: bool = False,
+        artifacts: tuple[dict[str, Any], ...] = (),
+        tools: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.executions: list[dict[str, Any]] = []
         self.fail_revision_once = fail_revision_once
+        self.artifacts = artifacts
+        self.tools = tools or []
 
     def create_plan(self, issue: dict[str, Any]) -> TaskPlan:
         return TaskPlan(decision="no_skill", reason="チケット本文だけで対応可能")
 
     def planning_catalog(self) -> tuple[list[Any], list[dict[str, Any]]]:
-        return [], []
+        return [], self.tools
 
     def execute_plan(
         self,
@@ -65,6 +73,7 @@ class FakeOrchestrator:
             page_title="Article",
             briefing="保存済みの要約本文",
             bookmark_url="https://bookmark.test/links/1",
+            artifacts=self.artifacts,
         )
 
 
@@ -274,3 +283,101 @@ def test_resume_question_is_planned_and_executed_from_conversation() -> None:
         isinstance(message, AIMessage) and message.content == "要約を作成しました。"
         for message in state["messages"]
     )
+
+
+def test_revision_plan_preserves_step_based_work() -> None:
+    response = (
+        '{"previous_work_summary":"初回作業を完了した",'
+        '"feedback_summary":"追加調査と提案を求められた",'
+        '"requested_changes":["OpenClawを調査して提案する"],'
+        '"keep_existing_results":["既存コメント"],'
+        '"work_to_redo":["Web検索する","検索結果をもとに提案する"],'
+        '"task_plan":{"decision":"use_tools","reason":"検索後にLLMで提案できる",'
+        '"skill_name":null,"tool_names":["Webページの情報収集 (web_search_pages)"],"target_url":null,'
+        '"task_input":null,"user_request":null,'
+        '"steps":['
+        '{"kind":"tool","name":"Webページの情報収集 (web_search_pages)","purpose":"OpenClawを検索する",'
+        '"arguments":{"query":"openclaw"}},'
+        '{"kind":"llm","name":null,"purpose":"検索結果から企業内活用案を提案する",'
+        '"arguments":null}],'
+        '"limitations":["社内規程への適合は未確認"]}}'
+    )
+    llm = FakeLLM([response])
+    orchestrator = FakeOrchestrator(
+        tools=[{"name": "web_search_pages", "description": "Webページの情報収集"}]
+    )
+    graph = TicketConversationGraph(
+        task_orchestrator=orchestrator,  # type: ignore[arg-type]
+        llm=llm,
+        checkpointer=InMemorySaver(),
+        ai_user_id=42,
+    )
+    graph.run(issue=_issue())
+
+    events: list[SkillEvent] = []
+    graph.run(
+        issue=_issue(
+            journals=[
+                {"id": 1, "user": {"id": 7}, "notes": "OpenClawを調査して提案してください。"}
+            ]
+        ),
+        emit_event=events.append,
+    )
+
+    plan = orchestrator.executions[-1]["plan"]
+    assert plan.steps == (
+        TaskStep(
+            kind="tool",
+            purpose="OpenClawを検索する",
+            name="web_search_pages",
+            arguments={"query": "openclaw"},
+        ),
+        TaskStep(
+            kind="llm",
+            purpose="検索結果から企業内活用案を提案する",
+            name=None,
+            arguments=None,
+        ),
+    )
+    assert plan.limitations == ("社内規程への適合は未確認",)
+    assert "tool: OpenClawを検索する" in (events[0].notes or "")
+    assert "Webページの情報収集 (web_search_pages)" not in (events[0].notes or "")
+
+
+def test_search_artifact_is_saved_to_conversation_context() -> None:
+    artifact = {
+        "type": "web_search_pages",
+        "query": "生成AI",
+        "search_results": [
+            {
+                "rank": 1,
+                "title": "検索結果",
+                "url": "https://example.test/article",
+                "snippet": "概要",
+            }
+        ],
+        "pages": [
+            {
+                "rank": 1,
+                "url": "https://example.test/article",
+                "final_url": "https://example.test/article",
+                "title": "検索結果",
+                "text": "保存される本文",
+                "text_truncated": False,
+                "fetch_ok": True,
+                "error": None,
+            }
+        ],
+    }
+    graph = TicketConversationGraph(
+        task_orchestrator=FakeOrchestrator(artifacts=(artifact,)),  # type: ignore[arg-type]
+        llm=FakeLLM([]),
+        checkpointer=InMemorySaver(),
+        ai_user_id=42,
+    )
+
+    graph.run(issue=_issue())
+
+    state = graph.conversation_state(123)
+    assert state["artifacts"][0] == artifact
+    assert any("保存される本文" in str(message.content) for message in state["messages"])

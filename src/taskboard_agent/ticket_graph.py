@@ -16,6 +16,7 @@ from taskboard_agent.task_executor import (
     TaskOrchestrator,
     TaskPlan,
     TaskPlanningError,
+    normalize_task_plan_names,
     parse_task_plan,
 )
 
@@ -280,8 +281,11 @@ class TicketConversationGraph:
                         ensure_ascii=False,
                     )
                 )
+                plan = normalize_task_plan_names(plan, skills=skills, tools=revision_tools)
+                normalized_revision = dict(revision)
+                normalized_revision["task_plan"] = _task_plan_dict(plan)
                 return {
-                    "feedback_analysis": revision,
+                    "feedback_analysis": normalized_revision,
                     "current_plan": _task_plan_dict(plan),
                 }
             except (TaskPlanningError, ValueError, TypeError, KeyError) as exc:
@@ -339,13 +343,11 @@ class TicketConversationGraph:
             record(SkillEvent("final_review", "作業が終了しました。"))
         result_artifacts = _result_artifacts(result)
         if result_artifacts:
-            messages.append(
+            messages.extend(
                 AIMessage(
-                    content=(
-                        "今回の作業成果JSON:\n"
-                        f"{json.dumps(result_artifacts[0], ensure_ascii=False)}"
-                    )
+                    content=f"今回の作業成果JSON:\n{json.dumps(artifact, ensure_ascii=False)}"
                 )
+                for artifact in result_artifacts
             )
         artifacts = list(state.get("artifacts", []))
         artifacts.extend(result_artifacts)
@@ -421,6 +423,12 @@ def _revision_messages(
                 "会話履歴全体から過去の作業と最新の人間コメントを読み取り、質問か作業依頼かにかかわらず必ず計画してください。"
                 "保存済みの会話だけで回答できる場合はno_skillを選び、外部toolやskillを再実行しないでください。"
                 "Redmineへの計画・結果の投稿はシステムが行います。完了済みの外部操作を理由なく繰り返してはいけません。"
+                "再計画では必ず作業ステップに分解し、各ステップをskill/tool/llm/unavailableのいずれかに分類してください。"
+                "専用toolやskillがない作業でも、LLMで可能な要約・分析・比較・提案・文章作成はllmステップとして計画し、"
+                "実行できないことだけunavailableステップまたはlimitationsに明示してください。"
+                "toolステップのnameには利用可能なtoolのnameだけを正確に入れてください。説明文、表示名、括弧付き表記を混ぜないでください。"
+                "ユーザーが `web_search_pages` のようなtool名を明示した場合、nameにはその文字列だけを入れてください。"
+                "skillステップのnameにも利用可能なskillのnameだけを正確に入れてください。"
                 "task_inputは補足指示が必要な場合だけinstructionとtarget_urlを設定してください。"
                 "出力構造と型はAPI側で指定されています。\n"
                 f"利用可能なスキル: {json.dumps(skills, ensure_ascii=False)}\n"
@@ -510,13 +518,41 @@ def _flatten_string_list(value: Any) -> list[str] | None:
 
 
 def _format_revision_comment(analysis: dict[str, Any]) -> str:
+    task_plan = analysis.get("task_plan")
+    step_text = _revision_step_text(task_plan if isinstance(task_plan, dict) else {})
+    limitation_text = _revision_limitation_text(task_plan if isinstance(task_plan, dict) else {})
     return (
         "差し戻し内容を確認し、作業を再計画しました。\n\n"
         f"指摘された内容:\n{analysis['feedback_summary']}\n\n"
         f"今回対応する内容:\n{_bullet_text(analysis['work_to_redo'])}\n\n"
         f"維持する既存成果:\n{_bullet_text(analysis['keep_existing_results'])}\n\n"
-        f"修正後の作業計画:\n{_numbered_text(analysis['work_to_redo'])}"
+        f"修正後の作業計画:\n{step_text or _numbered_text(analysis['work_to_redo'])}"
+        f"{limitation_text}"
     )
+
+
+def _revision_step_text(task_plan: dict[str, Any]) -> str:
+    steps = task_plan.get("steps")
+    if not isinstance(steps, list):
+        return ""
+    lines: list[str] = []
+    for index, step in enumerate(steps, 1):
+        if not isinstance(step, dict):
+            continue
+        kind = step.get("kind") or "unknown"
+        purpose = step.get("purpose") or "(目的未記載)"
+        lines.append(f"{index}. {kind}: {purpose}")
+    return "\n".join(lines)
+
+
+def _revision_limitation_text(task_plan: dict[str, Any]) -> str:
+    limitations = task_plan.get("limitations")
+    if not isinstance(limitations, list):
+        return ""
+    items = [item for item in limitations if isinstance(item, str) and item.strip()]
+    if not items:
+        return ""
+    return "\n\n実行できないこと・未確認事項:\n" + "\n".join(f"- {item}" for item in items)
 
 
 def _bullet_text(items: list[str]) -> str:
@@ -530,6 +566,8 @@ def _numbered_text(items: list[str]) -> str:
 def _task_plan_dict(plan: TaskPlan) -> dict[str, Any]:
     data = asdict(plan)
     data["tool_names"] = list(plan.tool_names)
+    data["steps"] = [asdict(step) for step in plan.steps]
+    data["limitations"] = list(plan.limitations)
     return data
 
 
@@ -547,6 +585,7 @@ def _execution_result_dict(result: SkillExecutionResult) -> dict[str, Any]:
         "briefing": result.briefing,
         "bookmark_url": result.bookmark_url,
         "bookmark_payload": result.bookmark_payload,
+        "artifacts": list(result.artifacts),
         "dry_run": result.dry_run,
     }
 
@@ -562,11 +601,15 @@ def _execution_result_from_dict(
         briefing=data.get("briefing"),
         bookmark_url=data.get("bookmark_url"),
         bookmark_payload=data.get("bookmark_payload"),
+        artifacts=tuple(
+            item for item in data.get("artifacts", []) if isinstance(item, dict)
+        ),
         dry_run=bool(data.get("dry_run", dry_run)),
     )
 
 
 def _result_artifacts(result: SkillExecutionResult) -> list[dict[str, Any]]:
+    artifacts = list(result.artifacts)
     artifact = {
         key: value
         for key, value in {
@@ -578,7 +621,9 @@ def _result_artifacts(result: SkillExecutionResult) -> list[dict[str, Any]]:
         }.items()
         if value is not None
     }
-    return [artifact] if artifact else []
+    if artifact:
+        artifacts.append(artifact)
+    return artifacts
 
 
 def _initial_issue_message(issue: dict[str, Any]) -> str:

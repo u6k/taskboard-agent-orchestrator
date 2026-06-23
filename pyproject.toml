@@ -5,6 +5,7 @@ description = "Redmine-backed taskboard agent orchestrator"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "ddgs>=9.5.5",
     "httpx>=0.28.0",
     "langgraph>=1.2.6",
     "langgraph-checkpoint-sqlite>=3.1.0",

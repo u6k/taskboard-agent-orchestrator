@@ -14,10 +14,12 @@ from taskboard_agent.task_executor import (
     LiteLLMTaskPlanner,
     TaskOrchestrator,
     TaskPlan,
+    TaskStep,
     TaskPlanningError,
     parse_task_plan,
 )
 from taskboard_agent.tools import ToolRegistry, ToolRegistryError, ToolSpec
+from taskboard_agent.tools import ToolExecutionResult
 
 
 class FakeLLM:
@@ -78,6 +80,65 @@ class FakeToolCatalog:
         ]
 
 
+class StepToolCatalog:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def registry_for(self, tool_names: tuple[str, ...] | list[str]) -> ToolRegistry:
+        self.calls.append({"tool_names": tuple(tool_names)})
+        registry = ToolRegistry()
+        if "web_search_pages" in tool_names:
+            registry.register(
+                ToolSpec(
+                    name="web_search_pages",
+                    description="Search pages.",
+                    parameters={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                ),
+                lambda query: {
+                    "ok": True,
+                    "context_artifact": {
+                        "type": "web_search_pages",
+                        "query": query,
+                        "search_results": [
+                            {
+                                "rank": 1,
+                                "title": "OpenClaw",
+                                "url": "https://openclaw.ai/",
+                                "snippet": "概要",
+                            }
+                        ],
+                        "pages": [
+                            {
+                                "rank": 1,
+                                "url": "https://openclaw.ai/",
+                                "final_url": "https://openclaw.ai/",
+                                "title": "OpenClaw",
+                                "text": "企業内の自動化に活用できるAIエージェントです。",
+                                "text_truncated": False,
+                                "fetch_ok": True,
+                                "error": None,
+                            }
+                        ],
+                    },
+                },
+            )
+        return registry
+
+    def summaries(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "web_search_pages",
+                "description": "Web検索して本文を取得する。",
+                "risk": "read",
+            }
+        ]
+
+
 class FakeSkillAgent:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -91,6 +152,7 @@ class FakeSkillAgent:
         approved_tools: set[str] | None = None,
         on_llm_response: Any | None = None,
         response_format: dict[str, Any] | None = None,
+        return_after_tool_names: set[str] | None = None,
     ) -> AgentRunResult:
         self.calls.append(
             {
@@ -98,6 +160,7 @@ class FakeSkillAgent:
                 "tools": tools,
                 "allow_writes": allow_writes,
                 "response_format": response_format,
+                "return_after_tool_names": return_after_tool_names,
             }
         )
         if on_llm_response is not None:
@@ -120,6 +183,89 @@ class FakeSkillAgent:
             ),
             messages=tuple(messages),
             tool_results=(),
+            stopped_reason="final",
+        )
+
+
+class SearchArtifactSkillAgent:
+    def __init__(
+        self,
+        *,
+        final_text: str = '{"status": "processed", "notes": "検索しました。"}',
+    ) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.final_text = final_text
+
+    def run(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: ToolRegistry | None = None,
+        allow_writes: bool = False,
+        approved_tools: set[str] | None = None,
+        on_llm_response: Any | None = None,
+        response_format: dict[str, Any] | None = None,
+        return_after_tool_names: set[str] | None = None,
+    ) -> AgentRunResult:
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "allow_writes": allow_writes,
+                "response_format": response_format,
+                "return_after_tool_names": return_after_tool_names,
+            }
+        )
+        return AgentRunResult(
+            final_text=self.final_text,
+            messages=tuple(messages),
+            tool_results=(
+                ToolExecutionResult(
+                    name="web_search_pages",
+                    content={
+                        "context_artifact": {
+                            "type": "web_search_pages",
+                            "query": "生成AI",
+                            "search_results": [
+                                {
+                                    "rank": 1,
+                                    "title": "正常ページ",
+                                    "url": "https://example.test/ok",
+                                    "snippet": "概要",
+                                },
+                                {
+                                    "rank": 2,
+                                    "title": "失敗ページ",
+                                    "url": "https://example.test/error",
+                                    "snippet": "",
+                                },
+                            ],
+                            "pages": [
+                                {
+                                    "rank": 1,
+                                    "url": "https://example.test/ok",
+                                    "final_url": "https://example.test/final",
+                                    "title": "正常ページ",
+                                    "text": "本文",
+                                    "text_truncated": False,
+                                    "fetch_ok": True,
+                                    "error": None,
+                                },
+                                {
+                                    "rank": 2,
+                                    "url": "https://example.test/error",
+                                    "final_url": None,
+                                    "title": None,
+                                    "text": "",
+                                    "text_truncated": False,
+                                    "fetch_ok": False,
+                                    "error": "HTTP 500",
+                                },
+                            ],
+                        }
+                    },
+                ),
+            ),
             stopped_reason="final",
         )
 
@@ -191,6 +337,36 @@ def test_parse_task_plan_reads_use_tools() -> None:
         reason="本文取得のみ",
         user_request=None,
     )
+
+
+def test_parse_task_plan_reads_steps_and_limitations() -> None:
+    plan = parse_task_plan(
+        '{"decision":"use_tools","reason":"検索後にLLMで提案する",'
+        '"skill_name":null,"tool_names":["web_search_pages"],"target_url":null,'
+        '"task_input":null,"user_request":null,'
+        '"steps":['
+        '{"kind":"tool","name":"web_search_pages","purpose":"OpenClawを検索する",'
+        '"arguments":{"query":"openclaw"}},'
+        '{"kind":"llm","name":null,"purpose":"企業内活用案を提案する","arguments":null}'
+        '],'
+        '"limitations":["社内規程への適合は未確認"]}'
+    )
+
+    assert plan.steps == (
+        TaskStep(
+            kind="tool",
+            name="web_search_pages",
+            purpose="OpenClawを検索する",
+            arguments={"query": "openclaw"},
+        ),
+        TaskStep(
+            kind="llm",
+            name=None,
+            purpose="企業内活用案を提案する",
+            arguments=None,
+        ),
+    )
+    assert plan.limitations == ("社内規程への適合は未確認",)
 
 
 def test_parse_task_plan_rejects_invalid_decision() -> None:
@@ -342,6 +518,35 @@ def test_task_planner_can_choose_direct_tools_for_narrow_request() -> None:
     assert plan.skill_name is None
 
 
+def test_task_planner_normalizes_display_tool_name_to_registered_name() -> None:
+    llm = FakeLLM(
+        [
+            '{"decision":"use_tools","reason":"明示されたtoolで検索する",'
+            '"skill_name":null,"tool_names":["Webページの情報収集 (web_search_pages)"],'
+            '"target_url":null,"task_input":null,"user_request":null,'
+            '"steps":[{"kind":"tool","name":"Webページの情報収集 (web_search_pages)",'
+            '"purpose":"指定キーワードで検索する","arguments":{"query":"パーソナルAIアシスタント"}}],'
+            '"limitations":[]}'
+        ]
+    )
+
+    plan = LiteLLMTaskPlanner(llm).plan(
+        _issue(),
+        [],
+        [{"name": "web_search_pages", "description": "Webページの情報収集"}],
+    )
+
+    assert plan.tool_names == ("web_search_pages",)
+    assert plan.steps == (
+        TaskStep(
+            kind="tool",
+            name="web_search_pages",
+            purpose="指定キーワードで検索する",
+            arguments={"query": "パーソナルAIアシスタント"},
+        ),
+    )
+
+
 def test_orchestrator_runs_selected_skill() -> None:
     tool_catalog = FakeToolCatalog()
     skill_agent = FakeSkillAgent()
@@ -406,6 +611,175 @@ def test_orchestrator_runs_selected_tools_without_skill() -> None:
     assert "fetch_web_pageを呼び出します" in result.events[1].notes
     assert "`fetch_web_page` を呼び出します" in result.events[1].notes
     assert result.events[-1].notes == "done"
+
+
+def test_orchestrator_reports_web_search_page_fetch_status() -> None:
+    tool_catalog = FakeToolCatalog()
+    skill_agent = SearchArtifactSkillAgent()
+    planner = StubPlanner(
+        TaskPlan(
+            decision="use_tools",
+            tool_names=("web_search_pages",),
+            reason="キーワード検索依頼",
+            task_input={"instruction": "生成AIを検索"},
+        )
+    )
+
+    result = TaskOrchestrator(
+        planner=planner,
+        skill_registry=FakeSkillRegistry([_skill()]),  # type: ignore[arg-type]
+        tool_catalog=tool_catalog,
+        skill_agent=skill_agent,  # type: ignore[arg-type]
+        generic_runner=GenericTaskRunner(FakeLLM([])),
+    ).run(issue=_issue())
+
+    assert result.status == "processed"
+    assert result.artifacts[0]["type"] == "web_search_pages"
+    assert skill_agent.calls[0]["return_after_tool_names"] == {"web_search_pages"}
+    assert "`web_search_pages`を使った場合" in skill_agent.calls[0]["messages"][0]["content"]
+    assert "検索結果と本文取得結果" in result.events[-1].notes
+    assert "本文取得: 正常" in result.events[-1].notes
+    assert "本文取得: エラー" in result.events[-1].notes
+
+
+def test_orchestrator_runs_step_plan_with_tool_then_llm() -> None:
+    generic = GenericTaskRunner(FakeLLM(["企業内活用案を提案しました。"]))
+    tool_catalog = StepToolCatalog()
+    plan = TaskPlan(
+        decision="use_tools",
+        reason="検索結果を使ってLLMで提案できる",
+        tool_names=("Webページの情報収集 (web_search_pages)",),
+        steps=(
+            TaskStep(
+                kind="tool",
+                name="Webページの情報収集 (web_search_pages)",
+                purpose="OpenClawを検索して本文を取得する",
+                arguments={"query": "openclaw"},
+            ),
+            TaskStep(
+                kind="llm",
+                purpose="検索結果をもとに企業内活用案を提案する",
+            ),
+        ),
+        limitations=("社内規程への適合は未確認",),
+    )
+
+    result = TaskOrchestrator(
+        planner=StubPlanner(plan),
+        skill_registry=FakeSkillRegistry([_skill()]),  # type: ignore[arg-type]
+        tool_catalog=tool_catalog,  # type: ignore[arg-type]
+        skill_agent=FakeSkillAgent(),
+        generic_runner=generic,
+    ).run(issue=_issue())
+
+    assert result.status == "processed"
+    assert tool_catalog.calls[0]["tool_names"] == ("web_search_pages",)
+    assert result.artifacts[0]["type"] == "web_search_pages"
+    assert "作業ステップ" in result.events[0].notes
+    assert "社内規程への適合は未確認" in result.events[0].notes
+    assert any("企業内活用案を提案しました" in (event.notes or "") for event in result.events)
+    assert "企業内の自動化に活用できるAIエージェント" in str(generic._llm.messages[0])
+
+
+def test_orchestrator_repairs_missing_web_search_query_from_previous_step() -> None:
+    generic = GenericTaskRunner(
+        FakeLLM(
+            [
+                "検索キーワード「パーソナルAIアシスタント ビジネス活用」を用いてWeb検索を実行します。"
+            ]
+        )
+    )
+    tool_catalog = StepToolCatalog()
+    plan = TaskPlan(
+        decision="use_tools",
+        reason="検索後に分析する",
+        tool_names=("web_search_pages",),
+        steps=(
+            TaskStep(
+                kind="llm",
+                purpose="検索キーワードを準備する",
+            ),
+            TaskStep(
+                kind="tool",
+                name="web_search_pages",
+                purpose="実際にWeb検索を実行し、関連性の高い複数の情報源からテキストデータを取得する。",
+                arguments=None,
+            ),
+        ),
+        limitations=("Web検索は取得時点の情報に限定される",),
+    )
+
+    result = TaskOrchestrator(
+        planner=StubPlanner(plan),
+        skill_registry=FakeSkillRegistry([_skill()]),  # type: ignore[arg-type]
+        tool_catalog=tool_catalog,  # type: ignore[arg-type]
+        skill_agent=FakeSkillAgent(),
+        generic_runner=generic,
+    ).run(issue=_issue())
+
+    assert result.status == "processed"
+    assert result.artifacts[0]["query"] == "パーソナルAIアシスタント ビジネス活用"
+    assert any("不足引数 `query` を文脈から補完" in (event.notes or "") for event in result.events)
+
+
+def test_orchestrator_recovers_tool_step_after_schema_failure() -> None:
+    generic = GenericTaskRunner(FakeLLM([]))
+    tool_catalog = StepToolCatalog()
+    plan = TaskPlan(
+        decision="use_tools",
+        reason="検索する",
+        tool_names=("web_search_pages",),
+        steps=(
+            TaskStep(
+                kind="tool",
+                name="web_search_pages",
+                purpose="OpenClawを検索する",
+                arguments={"query": "openclaw", "unused": "remove me"},
+            ),
+        ),
+    )
+
+    result = TaskOrchestrator(
+        planner=StubPlanner(plan),
+        skill_registry=FakeSkillRegistry([_skill()]),  # type: ignore[arg-type]
+        tool_catalog=tool_catalog,  # type: ignore[arg-type]
+        skill_agent=FakeSkillAgent(),
+        generic_runner=generic,
+    ).run(issue=_issue())
+
+    assert result.status == "processed"
+    assert result.artifacts[0]["query"] == "openclaw"
+    assert any("失敗原因を確認" in (event.notes or "") for event in result.events)
+    assert any("スキーマにない引数を除去" in (event.notes or "") for event in result.events)
+    assert len(tool_catalog.calls) == 2
+
+
+def test_orchestrator_falls_back_when_web_search_final_json_is_empty() -> None:
+    tool_catalog = FakeToolCatalog()
+    skill_agent = SearchArtifactSkillAgent(final_text="")
+    planner = StubPlanner(
+        TaskPlan(
+            decision="use_tools",
+            tool_names=("web_search_pages",),
+            reason="キーワード検索依頼",
+            task_input={"instruction": "生成AIを検索"},
+        )
+    )
+
+    result = TaskOrchestrator(
+        planner=planner,
+        skill_registry=FakeSkillRegistry([_skill()]),  # type: ignore[arg-type]
+        tool_catalog=tool_catalog,
+        skill_agent=skill_agent,  # type: ignore[arg-type]
+        generic_runner=GenericTaskRunner(FakeLLM([])),
+    ).run(issue=_issue())
+
+    assert result.status == "processed"
+    assert result.artifacts[0]["type"] == "web_search_pages"
+    assert "最終JSON生成が空または不正" in result.events[-1].notes
+    assert "検索結果と本文取得結果" in result.events[-1].notes
+    assert "本文取得: 正常" in result.events[-1].notes
+    assert "本文取得: エラー" in result.events[-1].notes
 
 
 def test_orchestrator_returns_needs_user_when_skill_is_missing() -> None:

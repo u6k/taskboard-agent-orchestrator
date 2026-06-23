@@ -31,6 +31,7 @@ class SkillAgentPort(Protocol):
         approved_tools: set[str] | None = None,
         on_llm_response: Callable[[LLMResponse], None] | None = None,
         response_format: dict[str, Any] | None = None,
+        return_after_tool_names: set[str] | None = None,
     ) -> AgentRunResult:
         ...
 
@@ -53,6 +54,7 @@ class SkillExecutionResult:
     briefing: str | None = None
     bookmark_url: str | None = None
     bookmark_payload: dict[str, Any] | None = None
+    artifacts: tuple[dict[str, Any], ...] = ()
     dry_run: bool = False
 
 
@@ -150,6 +152,7 @@ class GenericSkillRunner:
             skill_name=self._skill.name,
             dry_run=dry_run,
         )
+        result = _with_tool_artifacts(result, agent_result.tool_results)
         if emit_event is not None or not llm_events:
             return result
         return _insert_after_start(result, tuple(llm_events))
@@ -287,8 +290,109 @@ def _insert_after_start(
         briefing=result.briefing,
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
+        artifacts=result.artifacts,
         dry_run=result.dry_run,
     )
+
+
+def _with_tool_artifacts(
+    result: SkillExecutionResult,
+    tool_results: tuple[Any, ...],
+) -> SkillExecutionResult:
+    artifacts = _tool_artifacts(tool_results)
+    if not artifacts:
+        return result
+    return SkillExecutionResult(
+        status=result.status,
+        events=tuple(_append_artifact_reports(result.events, artifacts)),
+        target_url=result.target_url,
+        page_title=result.page_title,
+        briefing=result.briefing,
+        bookmark_url=result.bookmark_url,
+        bookmark_payload=result.bookmark_payload,
+        artifacts=(*result.artifacts, *artifacts),
+        dry_run=result.dry_run,
+    )
+
+
+def _tool_artifacts(tool_results: tuple[Any, ...]) -> tuple[dict[str, Any], ...]:
+    artifacts: list[dict[str, Any]] = []
+    for result in tool_results:
+        content = getattr(result, "content", None)
+        if not isinstance(content, dict):
+            continue
+        artifact = content.get("context_artifact")
+        if isinstance(artifact, dict):
+            artifacts.append(artifact)
+    return tuple(artifacts)
+
+
+def _append_artifact_reports(
+    events: tuple[SkillEvent, ...],
+    artifacts: tuple[dict[str, Any], ...],
+) -> list[SkillEvent]:
+    report = _artifact_report(artifacts)
+    if not report:
+        return list(events)
+    updated = list(events)
+    for index in range(len(updated) - 1, -1, -1):
+        if updated[index].kind in ("final_review", "final_return"):
+            notes = updated[index].notes or ""
+            updated[index] = SkillEvent(
+                updated[index].kind,
+                f"{notes.rstrip()}\n\n{report}" if notes else report,
+            )
+            return updated
+    updated.append(SkillEvent("final_review", report))
+    return updated
+
+
+def _artifact_report(artifacts: tuple[dict[str, Any], ...]) -> str:
+    parts = [
+        _web_search_pages_report(artifact)
+        for artifact in artifacts
+        if artifact.get("type") == "web_search_pages"
+    ]
+    return "\n\n".join(part for part in parts if part)
+
+
+def _web_search_pages_report(artifact: dict[str, Any]) -> str:
+    query = artifact.get("query")
+    lines = [f"## 検索結果と本文取得結果\n\n検索キーワード: {query or '(未記録)'}"]
+    search_results = artifact.get("search_results")
+    if isinstance(search_results, list):
+        lines.append("\n検索結果:")
+        for item in search_results:
+            if not isinstance(item, dict):
+                continue
+            rank = item.get("rank")
+            title = item.get("title") or "(無題)"
+            url = item.get("url") or ""
+            snippet = item.get("snippet") or ""
+            lines.append(f"- {rank}. {title} - {url}")
+            if snippet:
+                lines.append(f"  概要: {snippet}")
+    pages = artifact.get("pages")
+    if isinstance(pages, list):
+        lines.append("\n本文取得:")
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            rank = page.get("rank")
+            if page.get("fetch_ok") is True:
+                text = page.get("text")
+                text_len = len(text) if isinstance(text, str) else 0
+                final_url = page.get("final_url") or page.get("url") or ""
+                title = page.get("title") or "(無題)"
+                truncated = " / 切り詰めあり" if page.get("text_truncated") else ""
+                lines.append(
+                    f"- {rank}. 本文取得: 正常 / {title} / {text_len}字{truncated} / {final_url}"
+                )
+            else:
+                url = page.get("url") or ""
+                error = page.get("error") or "不明なエラー"
+                lines.append(f"- {rank}. 本文取得: エラー / {url} / 理由: {error}")
+    return "\n".join(lines)
 
 
 def _truncate(value: str) -> str:
@@ -330,5 +434,6 @@ def _add_agent_completion_notes(result: SkillExecutionResult) -> SkillExecutionR
         briefing=result.briefing,
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
+        artifacts=result.artifacts,
         dry_run=result.dry_run,
     )

@@ -123,6 +123,7 @@ def _task_plan_schema(
 ) -> dict[str, Any]:
     skills = sorted({name for name in skill_names if name})
     tools = sorted({name for name in tool_names if name})
+    step_names = sorted({*skills, *tools})
     return {
         "type": "object",
         "properties": {
@@ -152,6 +153,29 @@ def _task_plan_schema(
                 ]
             },
             "user_request": {"type": ["string", "null"]},
+            "steps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["skill", "tool", "llm", "unavailable"],
+                        },
+                        "name": _nullable_enum_schema(step_names),
+                        "purpose": {"type": "string"},
+                        "arguments": {
+                            "anyOf": [
+                                {"type": "object"},
+                                {"type": "null"},
+                            ]
+                        },
+                    },
+                    "required": ["kind", "name", "purpose", "arguments"],
+                    "additionalProperties": False,
+                },
+            },
+            "limitations": _string_array_schema(),
         },
         "required": [
             "decision",
@@ -161,6 +185,8 @@ def _task_plan_schema(
             "target_url",
             "task_input",
             "user_request",
+            "steps",
+            "limitations",
         ],
         "additionalProperties": False,
     }
