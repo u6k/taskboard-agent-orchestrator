@@ -67,15 +67,33 @@ class FunctionCallingAgent:
                 working_messages,
                 tools=registry.litellm_tools(),
                 tool_choice="auto",
-                response_format=response_format,
             )
             if not response.tool_calls:
                 if response.content:
                     working_messages.append(
                         {"role": "assistant", "content": response.content}
                     )
+                final_response = response
+                if response_format is not None:
+                    final_response = self._llm.complete(
+                        [
+                            *working_messages,
+                            {
+                                "role": "user",
+                                "content": (
+                                    "これまでの会話とtool実行結果を基に、最終結果だけを"
+                                    "指定された出力構造で返してください。追加のtoolは呼び出さないでください。"
+                                ),
+                            },
+                        ],
+                        response_format=response_format,
+                    )
+                    if final_response.content:
+                        working_messages.append(
+                            {"role": "assistant", "content": final_response.content}
+                        )
                 return AgentRunResult(
-                    final_text=response.content,
+                    final_text=final_response.content,
                     messages=tuple(working_messages),
                     tool_results=tuple(tool_results),
                     stopped_reason="final",

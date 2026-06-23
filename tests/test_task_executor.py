@@ -143,6 +143,18 @@ def _skill() -> Skill:
     )
 
 
+def _weekly_skill() -> Skill:
+    return Skill(
+        name="weekly-docx-report-extractor",
+        description="添付された週報DOCXを解析する。",
+        required_tools=("extract_redmine_docx", "summarize_weekly_docx"),
+        risk_level="read",
+        path=Path("skills/weekly-docx-report-extractor/SKILL.md"),
+        body="手順",
+        runner="run.py",
+    )
+
+
 def test_parse_task_plan_reads_use_skill() -> None:
     plan = parse_task_plan(
         '{"decision": "use_skill", "skill_name": "web-briefing-bookmark", '
@@ -273,6 +285,34 @@ def test_task_planner_includes_available_skills_in_prompt() -> None:
     assert response_format["json_schema"]["strict"] is True
     assert "task_input" in response_format["json_schema"]["schema"]["properties"]
     assert "JSON objectだけ" not in llm.messages[0][1]["content"]
+    assert "依頼目的全体と一致するskillがある場合" in llm.messages[0][1]["content"]
+
+
+def test_task_planner_asks_llm_to_validate_explicit_skill_against_request() -> None:
+    llm = FakeLLM(
+        [
+            '{"decision":"use_skill","reason":"明示されたスキルが週報要約依頼と整合する",'
+            '"skill_name":"weekly-docx-report-extractor","tool_names":[],'
+            '"target_url":null,"task_input":null,"user_request":null}'
+        ]
+    )
+
+    plan = LiteLLMTaskPlanner(llm).plan(
+        {
+            "id": 10800,
+            "subject": "6/21 週報",
+            "description": "weekly-docx-report-extractorスキルを実行してください。",
+        },
+        [_skill(), _weekly_skill()],
+        [],
+    )
+
+    assert plan.decision == "use_skill"
+    assert plan.skill_name == "weekly-docx-report-extractor"
+    assert len(llm.messages) == 1
+    planning_prompt = llm.messages[0][1]["content"]
+    assert "名前だけで機械的に選ばず" in planning_prompt
+    assert "weekly-docx-report-extractorスキルを実行してください" in planning_prompt
 
 
 def test_task_planner_can_choose_direct_tools_for_narrow_request() -> None:

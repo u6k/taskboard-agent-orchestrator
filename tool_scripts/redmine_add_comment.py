@@ -19,6 +19,7 @@ TOOL_SPEC = ToolSpec(
         "additionalProperties": False,
     },
     risk="write",
+    planner_visible=False,
 )
 DRY_RUN_SAFE = True
 

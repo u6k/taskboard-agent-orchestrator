@@ -64,7 +64,7 @@ def test_update_description_note_and_reassign_sends_description_notes_and_assign
     }
 
 
-def test_get_issue_requests_journals() -> None:
+def test_get_issue_requests_journals_and_attachments() -> None:
     seen_request: httpx.Request | None = None
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -82,7 +82,67 @@ def test_get_issue_requests_journals() -> None:
 
     assert issue["id"] == 123
     assert seen_request is not None
-    assert httpx.QueryParams(seen_request.url.query)["include"] == "journals"
+    assert httpx.QueryParams(seen_request.url.query)["include"] == "journals,attachments"
+
+
+def test_download_attachment_uses_api_auth_and_enforces_size() -> None:
+    seen_request: httpx.Request | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_request
+        seen_request = request
+        return httpx.Response(200, content=b"docx", headers={"Content-Length": "4"})
+
+    client = RedmineClient(
+        "https://redmine.example.test/redmine",
+        "api-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    content = client.download_attachment(
+        "https://redmine.example.test/redmine/attachments/download/9/report.docx",
+        max_bytes=4,
+    )
+
+    assert content == b"docx"
+    assert seen_request is not None
+    assert seen_request.headers["X-Redmine-API-Key"] == "api-key"
+
+
+def test_download_attachment_rejects_other_origin_or_base_path() -> None:
+    client = RedmineClient("https://redmine.example.test/redmine", "api-key")
+
+    for url in (
+        "https://evil.example.test/redmine/attachments/1/a.docx",
+        "https://redmine.example.test/other/attachments/1/a.docx",
+    ):
+        try:
+            client.download_attachment(url)
+        except Exception as exc:
+            assert "attachment URL" in str(exc)
+        else:  # pragma: no cover - defensive assertion
+            raise AssertionError("unsafe attachment URL was accepted")
+
+
+def test_download_attachment_rejects_declared_oversize() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"large", headers={"Content-Length": "5"})
+
+    client = RedmineClient(
+        "https://redmine.example.test",
+        "api-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    try:
+        client.download_attachment(
+            "https://redmine.example.test/attachments/download/1/a.docx",
+            max_bytes=4,
+        )
+    except Exception as exc:
+        assert "exceeds 4 bytes" in str(exc)
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("oversized attachment was accepted")
 
 
 def test_update_issue_sends_notes_status_and_assignment() -> None:
