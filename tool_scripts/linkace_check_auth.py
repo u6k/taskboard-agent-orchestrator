@@ -2,27 +2,22 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain.tools import tool
+from langchain_core.tools import BaseTool
+
 from taskboard_agent.tool_loader import ToolRuntimeContext
-from taskboard_agent.tools import ToolSpec
 
 
-TOOL_SPEC = ToolSpec(
-    name="linkace_check_auth",
-    description="LinkAce API token authenticationを確認する。",
-    parameters={
-        "type": "object",
-        "properties": {},
-        "required": [],
-        "additionalProperties": False,
-    },
-    risk="read",
-)
-
-
-def create_handler(context: ToolRuntimeContext) -> Any:
+def create_tool(context: ToolRuntimeContext) -> BaseTool:
     bookmark_client = context.require_service("bookmark_client")
 
-    def handle() -> dict[str, Any]:
+    @tool(
+        parse_docstring=True,
+        error_on_invalid_docstring=False,
+        extras={"risk": "read", "planner_visible": True},
+    )
+    def linkace_check_auth() -> dict[str, Any]:
+        """LinkAce API token authenticationを確認する。"""
         if context.dry_run:
             return {"ok": True, "dry_run": True, "skipped": True}
         try:
@@ -31,4 +26,4 @@ def create_handler(context: ToolRuntimeContext) -> Any:
             return {"ok": False, "error": str(exc)}
         return {"ok": True}
 
-    return handle
+    return linkace_check_auth

@@ -6,6 +6,8 @@ import re
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal, Protocol
 
+from langchain_core.tools import BaseTool
+
 from taskboard_agent.llm import LLMResponse
 from taskboard_agent.skill_runtime import (
     GenericSkillRunner,
@@ -23,7 +25,13 @@ from taskboard_agent.structured_output import (
     task_plan_response_format,
     tool_execution_response_format,
 )
-from taskboard_agent.tools import ToolExecutionResult, ToolRegistry, ToolRegistryError
+from taskboard_agent.tools import (
+    ToolExecutionError,
+    ToolExecutionResult,
+    execute_tool,
+    require_tools_registered,
+    tool_by_name,
+)
 
 
 PlanDecision = Literal["use_skill", "use_tools", "no_skill", "needs_user"]
@@ -53,7 +61,7 @@ class ToolCatalogPort(Protocol):
     def summaries(self) -> list[dict[str, Any]]:
         ...
 
-    def registry_for(self, tool_names: tuple[str, ...] | list[str]) -> ToolRegistry:
+    def tools_for(self, tool_names: tuple[str, ...] | list[str]) -> list[BaseTool]:
         ...
 
 
@@ -224,13 +232,13 @@ class GenericToolsRunner:
         self,
         *,
         issue: dict[str, Any],
-        tools: ToolRegistry,
+        tools: list[BaseTool],
         tool_names: tuple[str, ...],
         task_input: dict[str, Any] | None = None,
         dry_run: bool = False,
         emit_event: SkillEventSink | None = None,
     ) -> SkillExecutionResult:
-        tools.require_registered(tool_names)
+        require_tools_registered(tools, tool_names)
         llm_events: list[SkillEvent] = []
 
         def record_llm_response(response: LLMResponse) -> None:
@@ -365,8 +373,8 @@ class TaskOrchestrator:
             if not plan.tool_names:
                 return _needs_user_result("利用するtoolを特定できませんでした。作業内容を具体的に追記してください。")
             try:
-                tool_registry = self._tool_catalog.registry_for(plan.tool_names)
-            except (ToolRegistryError, RuntimeError) as exc:
+                tools = self._tool_catalog.tools_for(plan.tool_names)
+            except (ToolExecutionError, RuntimeError) as exc:
                 return _needs_user_result(
                     f"必要なtoolが不足しています。\n理由: {exc}"
                 )
@@ -377,7 +385,7 @@ class TaskOrchestrator:
                 emit_event(_plan_start_event(plan))
             result = self._tools_runner.run(
                 issue=execution_issue,
-                tools=tool_registry,
+                tools=tools,
                 tool_names=plan.tool_names,
                 task_input=task_input,
                 dry_run=dry_run,
@@ -398,17 +406,17 @@ class TaskOrchestrator:
                 f"必要なスキル `{plan.skill_name}` が登録されていません。利用可能なスキルを追加してください。"
             )
         try:
-            tool_registry = self._tool_catalog.registry_for(skill.required_tools)
-        except (ToolRegistryError, RuntimeError) as exc:
+            tools = self._tool_catalog.tools_for(skill.required_tools)
+        except (ToolExecutionError, RuntimeError) as exc:
             return _needs_user_result(
                 f"スキル `{plan.skill_name}` に必要なtoolが不足しています。\n理由: {exc}"
             )
         if skill.runner is not None:
-            runner = ScriptedSkillRunner(skill=skill, tools=tool_registry)
+            runner = ScriptedSkillRunner(skill=skill, tools=tools)
         else:
             runner = GenericSkillRunner(
                 skill=skill,
-                tools=tool_registry,
+                tools=tools,
                 skill_agent=self._skill_agent,
             )
         task_input = dict(plan.task_input or {})
@@ -525,23 +533,29 @@ class TaskOrchestrator:
         if not step.name:
             return _missing_step_name_result("tool", step)
         try:
-            tool_registry = self._tool_catalog.registry_for((step.name,))
-        except (ToolRegistryError, RuntimeError) as exc:
+            tools = self._tool_catalog.tools_for((step.name,))
+        except (ToolExecutionError, RuntimeError) as exc:
             return _needs_user_result(f"必要なtool `{step.name}` が不足しています。\n理由: {exc}")
+        selected_tool = tool_by_name(tools, step.name)
         arguments, repair_events = _repair_tool_step_arguments(
-            tool_registry=tool_registry,
+            tool=selected_tool,
             step=step,
             plan=plan,
             issue=issue,
             step_context=step_context,
         )
+        arguments, schema_events = _normalize_tool_arguments_for_schema(
+            tool=selected_tool,
+            tool_name=step.name,
+            arguments=arguments,
+        )
         try:
-            tool_result = tool_registry.execute(
-                step.name,
+            tool_result = execute_tool(
+                selected_tool,
                 arguments,
                 allow_writes=not dry_run,
             )
-        except (ToolRegistryError, RuntimeError) as exc:
+        except (ToolExecutionError, RuntimeError) as exc:
             return SkillExecutionResult(
                 status="failed",
                 events=(SkillEvent("final_return", f"tool `{step.name}` の実行に失敗しました。\n理由: {exc}"),),
@@ -554,8 +568,8 @@ class TaskOrchestrator:
         )
         if result is None:
             result = _tool_result_execution(tool_result, dry_run=dry_run)
-        if repair_events:
-            result = _insert_after_start(result, tuple(repair_events))
+        if repair_events or schema_events:
+            result = _insert_after_start(result, (*repair_events, *schema_events))
         return _with_tool_artifacts(result, (tool_result,))
 
     def _run_skill_step(
@@ -572,15 +586,15 @@ class TaskOrchestrator:
         if skill is None:
             return _needs_user_result(f"必要なスキル `{step.name}` が登録されていません。")
         try:
-            tool_registry = self._tool_catalog.registry_for(skill.required_tools)
-        except (ToolRegistryError, RuntimeError) as exc:
+            tools = self._tool_catalog.tools_for(skill.required_tools)
+        except (ToolExecutionError, RuntimeError) as exc:
             return _needs_user_result(f"スキル `{step.name}` に必要なtoolが不足しています。\n理由: {exc}")
         runner = (
-            ScriptedSkillRunner(skill=skill, tools=tool_registry)
+            ScriptedSkillRunner(skill=skill, tools=tools)
             if skill.runner is not None
             else GenericSkillRunner(
                 skill=skill,
-                tools=tool_registry,
+                tools=tools,
                 skill_agent=self._skill_agent,
             )
         )
@@ -692,9 +706,10 @@ class TaskOrchestrator:
         if not step.name:
             return None
         try:
-            tool_registry = self._tool_catalog.registry_for((step.name,))
-        except (ToolRegistryError, RuntimeError):
+            tools = self._tool_catalog.tools_for((step.name,))
+        except (ToolExecutionError, RuntimeError):
             return None
+        selected_tool = tool_by_name(tools, step.name)
         repaired_context = [
             *step_context,
             {
@@ -703,26 +718,26 @@ class TaskOrchestrator:
             },
         ]
         arguments, repair_events = _repair_tool_step_arguments(
-            tool_registry=tool_registry,
+            tool=selected_tool,
             step=step,
             plan=plan,
             issue=issue,
             step_context=repaired_context,
         )
         arguments, schema_events = _normalize_tool_arguments_for_schema(
-            tool_registry=tool_registry,
+            tool=selected_tool,
             tool_name=step.name,
             arguments=arguments,
         )
         if arguments == (step.arguments or {}):
             return None
         try:
-            tool_result = tool_registry.execute(
-                step.name,
+            tool_result = execute_tool(
+                selected_tool,
                 arguments,
                 allow_writes=not dry_run,
             )
-        except (ToolRegistryError, RuntimeError) as exc:
+        except (ToolExecutionError, RuntimeError) as exc:
             return SkillExecutionResult(
                 status="failed",
                 events=(
@@ -858,18 +873,16 @@ def _canonical_catalog_name(value: str | None, catalog_names: set[str]) -> str |
 
 def _repair_tool_step_arguments(
     *,
-    tool_registry: ToolRegistry,
+    tool: BaseTool,
     step: TaskStep,
     plan: TaskPlan,
     issue: dict[str, Any],
     step_context: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], list[SkillEvent]]:
     arguments = dict(step.arguments or {})
-    spec = next((item for item in tool_registry.specs() if item.name == step.name), None)
-    if spec is None:
-        return arguments, []
-    required = spec.parameters.get("required")
-    properties = spec.parameters.get("properties")
+    schema = _tool_input_schema(tool)
+    required = schema.get("required")
+    properties = schema.get("properties")
     if not isinstance(required, list) or not isinstance(properties, dict):
         return arguments, []
 
@@ -898,30 +911,27 @@ def _repair_tool_step_arguments(
 
 def _normalize_tool_arguments_for_schema(
     *,
-    tool_registry: ToolRegistry,
+    tool: BaseTool,
     tool_name: str,
     arguments: dict[str, Any],
 ) -> tuple[dict[str, Any], list[SkillEvent]]:
-    spec = next((item for item in tool_registry.specs() if item.name == tool_name), None)
-    if spec is None:
-        return arguments, []
-    properties = spec.parameters.get("properties")
+    schema = _tool_input_schema(tool)
+    properties = schema.get("properties")
     if not isinstance(properties, dict):
         return arguments, []
 
     normalized = dict(arguments)
     events: list[SkillEvent] = []
-    if spec.parameters.get("additionalProperties", True) is False:
-        unknown = [key for key in normalized if key not in properties]
-        for key in unknown:
-            normalized.pop(key, None)
-        if unknown:
-            events.append(
-                SkillEvent(
-                    "progress",
-                    f"tool `{tool_name}` のスキーマにない引数を除去しました: {', '.join(unknown)}",
-                )
+    unknown = [key for key in normalized if key not in properties]
+    for key in unknown:
+        normalized.pop(key, None)
+    if unknown:
+        events.append(
+            SkillEvent(
+                "progress",
+                f"tool `{tool_name}` のスキーマにない引数を除去しました: {', '.join(unknown)}",
             )
+        )
 
     for key, value in list(normalized.items()):
         property_schema = properties.get(key)
@@ -973,6 +983,16 @@ def _schema_accepts_string(schema: Any) -> bool:
         return True
     expected_types = expected if isinstance(expected, list) else [expected]
     return "string" in expected_types
+
+
+def _tool_input_schema(tool: BaseTool) -> dict[str, Any]:
+    args_schema = tool.args_schema
+    if isinstance(args_schema, dict):
+        return args_schema
+    if hasattr(args_schema, "model_json_schema"):
+        schema = args_schema.model_json_schema()
+        return schema if isinstance(schema, dict) else {}
+    return {"type": "object", "properties": dict(tool.args)}
 
 
 def _infer_query_argument(

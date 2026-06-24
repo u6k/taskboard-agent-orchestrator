@@ -21,7 +21,7 @@ skillは、特定の業務を実行するための手順書である。`SKILL.md
 
 ## Tools
 
-toolは `tool_scripts/{tool_name}.py` として定義する。各toolは `TOOL_SPEC` と `create_handler(context)` を公開し、実行時に必要なサービスを `ToolRuntimeContext` から受け取る。
+toolは `tool_scripts/{tool_name}.py` として定義する。各toolは `create_tool(context)` を公開し、LangChain `@tool`、型注釈、docstringからtool schemaと説明を生成する。実行時に必要なサービスは `ToolRuntimeContext` から受け取り、`risk`, `planner_visible`, `dry_run_safe` は `BaseTool.extras` に保持する。
 
 | Tool | Risk | Planner visible | 概要 |
 | --- | --- | --- | --- |

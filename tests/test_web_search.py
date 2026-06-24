@@ -4,6 +4,7 @@ from pathlib import Path
 
 from taskboard_agent.page import PageContent
 from taskboard_agent.tool_loader import ToolRuntimeContext, ToolScriptCatalog
+from taskboard_agent.tools import execute_tool
 from taskboard_agent.web_search import DuckDuckGoSearchClient, SearchResult
 
 
@@ -95,10 +96,10 @@ def test_web_search_pages_tool_fetches_pages_and_records_partial_errors() -> Non
             settings={},
         ),
     )
-    registry = catalog.registry_for(("web_search_pages",))
+    web_search_pages = catalog.tools_for(("web_search_pages",))[0]
 
-    result = registry.execute(
-        "web_search_pages",
+    result = execute_tool(
+        web_search_pages,
         {"query": "生成AI", "max_results": 99, "page_text_max_chars": 3000},
     ).content
 

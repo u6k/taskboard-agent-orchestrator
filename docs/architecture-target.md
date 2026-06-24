@@ -90,7 +90,7 @@ Redmine更新は以下の方針で扱う。
 
 ## Tool / Skill方針
 
-tool定義やtool実行は、将来的にLangChain ToolやLangGraph `ToolNode` へ寄せる余地がある。ただし、業務上の制御は自前オーケストレーター側に残す。
+tool定義とfunction calling loopはLangChain ToolとLangGraphベースのagent harnessへ寄せる。ただし、業務上の制御は自前オーケストレーター側に残す。
 
 自前で維持するもの:
 
@@ -103,14 +103,14 @@ tool定義やtool実行は、将来的にLangChain ToolやLangGraph `ToolNode` �
 - 監査ログ
 - 再開時のstep判定
 
-LangChain / LangGraphへ寄せてもよいもの:
+LangChain / LangGraphへ寄せるもの:
 
 - tool schema生成
-- read系toolの呼び出しループ
+- function calling loop
 - tool実行エラーの標準化
-- `ToolNode` による低リスクtool実行
+- `ToolNode` 相当のtool実行
 
-移行はread系toolから始める。Redmine更新、外部書き込み、承認が必要な操作は、方針が固まるまで自前policyを優先する。
+Redmine更新、外部書き込み、承認が必要な操作は、LangChain Toolとして表現しても自前policyを優先する。
 
 ## 対象外
 

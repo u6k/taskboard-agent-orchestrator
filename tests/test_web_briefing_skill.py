@@ -3,27 +3,43 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from langchain_core.tools import BaseTool, StructuredTool
+
 from taskboard_agent.skill_runtime import ScriptedSkillRunner
 from taskboard_agent.skills import SkillRegistry
 from taskboard_agent.tool_loader import ToolRuntimeContext, ToolScriptCatalog
-from taskboard_agent.tools import ToolRegistry, ToolSpec
+from taskboard_agent.tools import execute_tool
 
 
 SKILLS_ROOT = Path(__file__).parents[1] / "skills"
 
 
-def _registry(handlers: dict[str, Callable[..., dict[str, Any]]]) -> ToolRegistry:
-    registry = ToolRegistry()
-    for name, handler in handlers.items():
-        registry.register(
-            ToolSpec(
-                name=name,
-                description=name,
-                parameters={"type": "object", "properties": {}},
-            ),
+def _tools(handlers: dict[str, Callable[..., dict[str, Any]]]) -> list[BaseTool]:
+    return [
+        StructuredTool.from_function(
             handler,
+            name=name,
+            description=name,
+            args_schema=_test_tool_schema(),
+            infer_schema=False,
+            extras={"risk": "read"},
         )
-    return registry
+        for name, handler in handlers.items()
+    ]
+
+
+def _test_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string"},
+            "title": {"type": "string"},
+            "text": {"type": "string"},
+            "description": {"type": "string"},
+            "issue_id": {"type": "integer"},
+            "notes": {"type": "string"},
+        },
+    }
 
 
 def _run(
@@ -34,7 +50,7 @@ def _run(
     dry_run: bool = False,
 ):
     skill = SkillRegistry(SKILLS_ROOT).get("web-briefing-bookmark")
-    return ScriptedSkillRunner(skill=skill, tools=_registry(handlers)).run(
+    return ScriptedSkillRunner(skill=skill, tools=_tools(handlers)).run(
         issue={"id": 123, "subject": "要約", "description": description},
         task_input=task_input,
         dry_run=dry_run,
@@ -290,10 +306,10 @@ def test_redmine_add_comment_tool_writes_and_honors_dry_run() -> None:
     normal = ToolScriptCatalog(
         root,
         ToolRuntimeContext(services={"redmine_client": redmine}, settings={}),
-    ).registry_for(("redmine_add_comment",))
+    ).tools_for(("redmine_add_comment",))
 
-    result = normal.execute(
-        "redmine_add_comment",
+    result = execute_tool(
+        normal[0],
         {"issue_id": 123, "notes": "進捗です。"},
         allow_writes=True,
     )
@@ -306,9 +322,9 @@ def test_redmine_add_comment_tool_writes_and_honors_dry_run() -> None:
         ToolRuntimeContext(
             services={"redmine_client": redmine}, settings={}, dry_run=True
         ),
-    ).registry_for(("redmine_add_comment",))
-    dry_result = dry_run.execute(
-        "redmine_add_comment",
+    ).tools_for(("redmine_add_comment",))
+    dry_result = execute_tool(
+        dry_run[0],
         {"issue_id": 123, "notes": "予定です。"},
     )
 

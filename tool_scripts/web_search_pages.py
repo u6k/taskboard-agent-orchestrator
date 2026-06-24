@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from langchain.tools import tool
+from langchain_core.tools import BaseTool
+
 from taskboard_agent.tool_loader import ToolRuntimeContext
-from taskboard_agent.tools import ToolSpec
 
 
 DEFAULT_MAX_RESULTS = 5
@@ -12,35 +14,15 @@ DEFAULT_PAGE_TEXT_MAX_CHARS = 6000
 logger = logging.getLogger("taskboard_agent.web_search_pages")
 
 
-TOOL_SPEC = ToolSpec(
-    name="web_search_pages",
-    description=(
-        "DuckDuckGo(ddgs)でキーワード検索し、検索結果ページ本文も取得する。"
-        "検索結果と各ページ本文取得の正常/エラー状態を返す。"
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string"},
-            "max_results": {"type": "integer"},
-            "page_text_max_chars": {"type": "integer"},
-            "region": {"type": "string"},
-            "safesearch": {"type": "string"},
-            "timelimit": {"type": ["string", "null"]},
-        },
-        "required": ["query"],
-        "additionalProperties": False,
-    },
-    risk="read",
-)
-
-
-def create_handler(context: ToolRuntimeContext) -> Any:
+def create_tool(context: ToolRuntimeContext) -> BaseTool:
     search_client = context.require_service("search_client")
     page_fetcher = context.require_service("page_fetcher")
 
-    def handle(
-        *,
+    @tool(
+        parse_docstring=True,
+        extras={"risk": "read", "planner_visible": True},
+    )
+    def web_search_pages(
         query: str,
         max_results: int = DEFAULT_MAX_RESULTS,
         page_text_max_chars: int = DEFAULT_PAGE_TEXT_MAX_CHARS,
@@ -48,6 +30,16 @@ def create_handler(context: ToolRuntimeContext) -> Any:
         safesearch: str = "moderate",
         timelimit: str | None = None,
     ) -> dict[str, Any]:
+        """DuckDuckGoでキーワード検索し、検索結果ページ本文も取得する。
+
+        Args:
+            query: 検索キーワード。
+            max_results: 取得する検索結果件数。
+            page_text_max_chars: 各ページ本文の最大文字数。
+            region: DuckDuckGo検索の地域指定。
+            safesearch: DuckDuckGo検索のセーフサーチ指定。
+            timelimit: DuckDuckGo検索の期間指定。指定しない場合はNone。
+        """
         max_results = _clamp(max_results, minimum=1, maximum=10)
         page_text_max_chars = _clamp(
             page_text_max_chars,
@@ -125,7 +117,7 @@ def create_handler(context: ToolRuntimeContext) -> Any:
             "context_artifact": artifact,
         }
 
-    return handle
+    return web_search_pages
 
 
 def _fetch_page(

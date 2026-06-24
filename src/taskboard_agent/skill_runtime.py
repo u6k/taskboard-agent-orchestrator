@@ -10,7 +10,13 @@ from taskboard_agent.agent import AgentRunResult
 from taskboard_agent.llm import LLMResponse
 from taskboard_agent.skills import Skill
 from taskboard_agent.structured_output import skill_execution_response_format
-from taskboard_agent.tools import ToolRegistry
+from langchain_core.tools import BaseTool
+
+from taskboard_agent.tools import (
+    execute_tool,
+    require_tools_registered,
+    tool_by_name,
+)
 
 
 SkillEventKind = Literal["start", "progress", "final_review", "final_return"]
@@ -26,7 +32,7 @@ class SkillAgentPort(Protocol):
         self,
         messages: list[dict[str, Any]],
         *,
-        tools: ToolRegistry | None = None,
+        tools: list[BaseTool] | None = None,
         allow_writes: bool = False,
         approved_tools: set[str] | None = None,
         on_llm_response: Callable[[LLMResponse], None] | None = None,
@@ -63,18 +69,15 @@ class ScriptedSkillContext:
     issue: dict[str, Any]
     task_input: dict[str, Any]
     dry_run: bool
-    tools: ToolRegistry
+    tools: list[BaseTool]
 
     def execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return self.tools.execute(
-            name,
-            arguments,
-            allow_writes=not self.dry_run,
-        ).content
+        tool = tool_by_name(self.tools, name)
+        return execute_tool(tool, arguments, allow_writes=not self.dry_run).content
 
 
 class ScriptedSkillRunner:
-    def __init__(self, *, skill: Skill, tools: ToolRegistry) -> None:
+    def __init__(self, *, skill: Skill, tools: list[BaseTool]) -> None:
         self._skill = skill
         self._tools = tools
 
@@ -87,7 +90,7 @@ class ScriptedSkillRunner:
         emit_event: SkillEventSink | None = None,
     ) -> SkillExecutionResult:
         del emit_event
-        self._tools.require_registered(self._skill.required_tools)
+        require_tools_registered(self._tools, self._skill.required_tools)
         run = _load_scripted_skill(self._skill)
         result = run(
             ScriptedSkillContext(
@@ -109,7 +112,7 @@ class GenericSkillRunner:
         self,
         *,
         skill: Skill,
-        tools: ToolRegistry,
+        tools: list[BaseTool],
         skill_agent: SkillAgentPort,
     ) -> None:
         self._skill = skill
@@ -124,7 +127,7 @@ class GenericSkillRunner:
         dry_run: bool = False,
         emit_event: SkillEventSink | None = None,
     ) -> SkillExecutionResult:
-        self._tools.require_registered(self._skill.required_tools)
+        require_tools_registered(self._tools, self._skill.required_tools)
         llm_events: list[SkillEvent] = []
 
         def record_llm_response(response: LLMResponse) -> None:

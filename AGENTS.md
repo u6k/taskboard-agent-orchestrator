@@ -52,7 +52,7 @@ READMEは初回読者向けの入口である。詳細設計、内部構造、�
 2. `TaskOrchestrator` から1step実行関数を切り出す。
 3. LangGraphノードで1stepずつ実行する。
 4. step単位の進捗、失敗、再開をRedmineコメントとcheckpointへ反映する。
-5. 必要に応じてread系toolからLangChain Tool / LangGraph `ToolNode` への移行を検証する。
+5. tool定義とfunction calling loopはLangChain/LangGraph標準を使い、業務policyは自前制御に残す。
 
 stepは配列から削除せず、`pending`, `running`, `completed`, `failed`, `needs_user`, `skipped` のようなstatusで管理する。
 
@@ -66,11 +66,11 @@ stepは配列から削除せず、`pending`, `running`, `completed`, `failed`, `
 
 ## Tool / Skill方針
 
-- `tool_scripts/{tool_name}.py` は `TOOL_SPEC` と `create_handler(context)` を公開する。
+- `tool_scripts/{tool_name}.py` は `create_tool(context)` を公開し、LangChain `@tool`、型注釈、docstringを正式なtool定義とする。
 - スキルは `skills/{skill_name}/SKILL.md` を正式な手順書として扱う。
 - `runner: "run.py"` があるスキルは、決定的なPython runnerを優先する。
 - LLM function callingに依存しすぎず、確実に実行したい手順はscripted runnerへ寄せる。
-- LangChain ToolやLangGraph `ToolNode` へ寄せる場合も、tool policy、dry-run、write禁止、人間承認は自前制御を維持する。
+- LangChain ToolやLangGraph agent loopを使う場合も、tool policy、dry-run、write禁止、人間承認は自前制御を維持する。
 
 ## テスト方針
 

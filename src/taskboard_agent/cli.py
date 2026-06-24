@@ -8,8 +8,9 @@ from pathlib import Path
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_litellm import ChatLiteLLM
 
-from taskboard_agent.agent import FunctionCallingAgent
+from taskboard_agent.agent import LangChainAgentRunner
 from taskboard_agent.config import ConfigError, load_config
 from taskboard_agent.linkace import LinkAceClient, LinkAceError
 from taskboard_agent.logging_config import configure_logging, log_trace
@@ -83,11 +84,12 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config()
         redmine = RedmineClient(config.redmine_url, config.redmine_api_key)
         llm = LiteLLMClient(model=config.llm_model)
+        chat_model = ChatLiteLLM(model=config.llm_model)
         page_fetcher = WebPageExtractor()
         search_client = DuckDuckGoSearchClient()
         bookmark_client = LinkAceClient(config.linkace_url, config.linkace_api_key)
         skill_registry = SkillRegistry(Path("skills"))
-        skill_agent = FunctionCallingAgent(llm=llm)
+        skill_agent = LangChainAgentRunner(model=chat_model)
         tool_catalog = ToolScriptCatalog(
             Path("tool_scripts"),
             ToolRuntimeContext(

@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import importlib.util
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol
 
-from taskboard_agent.tools import ToolRegistry, ToolRegistryError, ToolSpec
+from langchain_core.tools import BaseTool
+
+from taskboard_agent.tools import is_dry_run_safe, is_planner_visible, tool_risk
 
 
 class ToolScriptError(RuntimeError):
-    """Raised when a tool script cannot be loaded safely."""
+    """Raised when a LangChain tool script cannot be loaded safely."""
 
 
-class ToolHandlerFactory(Protocol):
-    def __call__(self, context: ToolRuntimeContext) -> Any:
+class ToolFactory(Protocol):
+    def __call__(self, context: ToolRuntimeContext) -> BaseTool:
         ...
 
 
@@ -45,59 +47,44 @@ class ToolScriptCatalog:
     def summaries(self) -> list[dict[str, Any]]:
         return [
             {
-                "name": spec.name,
-                "description": spec.description,
-                "risk": spec.risk,
+                "name": tool.name,
+                "description": tool.description,
+                "risk": tool_risk(tool),
             }
-            for spec in self.specs()
-            if spec.planner_visible
+            for tool in self.tools()
+            if is_planner_visible(tool)
         ]
 
-    def specs(self) -> list[ToolSpec]:
+    def tools(self) -> list[BaseTool]:
         if not self._root.exists():
             return []
-        specs: list[ToolSpec] = []
-        for path in sorted(self._root.glob("*.py")):
-            module = _load_module(path, path.stem)
-            spec = getattr(module, "TOOL_SPEC", None)
-            if not isinstance(spec, ToolSpec):
-                raise ToolScriptError(f"tool script missing TOOL_SPEC: {path}")
-            if spec.name != path.stem:
-                raise ToolScriptError(
-                    f"tool script name mismatch: expected {path.stem}, got {spec.name}"
-                )
-            specs.append(spec)
-        return specs
+        return [self._load(path.stem) for path in sorted(self._root.glob("*.py"))]
 
-    def registry_for(self, tool_names: tuple[str, ...] | list[str]) -> ToolRegistry:
-        registry = ToolRegistry()
-        for tool_name in tool_names:
-            spec, handler = self._load(tool_name)
-            registry.register(spec, handler)
-        return registry
+    def tools_for(self, tool_names: tuple[str, ...] | list[str]) -> list[BaseTool]:
+        return [self._load(tool_name) for tool_name in tool_names]
 
-    def _load(self, tool_name: str) -> tuple[ToolSpec, Any]:
+    def _load(self, tool_name: str) -> BaseTool:
         path = self._root / f"{tool_name}.py"
         if not path.exists():
-            raise ToolRegistryError(f"tool script is not registered: {tool_name}")
+            raise ToolScriptError(f"tool script is not registered: {tool_name}")
         module = _load_module(path, tool_name)
-        spec = getattr(module, "TOOL_SPEC", None)
-        if not isinstance(spec, ToolSpec):
-            raise ToolScriptError(f"tool script missing TOOL_SPEC: {path}")
-        if spec.name != tool_name:
+        factory = getattr(module, "create_tool", None)
+        if not callable(factory):
+            raise ToolScriptError(f"tool script missing create_tool: {path}")
+        tool = factory(self._context)
+        if not isinstance(tool, BaseTool):
+            raise ToolScriptError(f"create_tool must return BaseTool: {path}")
+        if tool.name != tool_name:
             raise ToolScriptError(
-                f"tool script name mismatch: expected {tool_name}, got {spec.name}"
+                f"tool script name mismatch: expected {tool_name}, got {tool.name}"
             )
         if (
             self._context.dry_run
-            and spec.risk == "write"
-            and getattr(module, "DRY_RUN_SAFE", False) is True
+            and tool_risk(tool) == "write"
+            and is_dry_run_safe(tool)
         ):
-            spec = replace(spec, risk="read")
-        factory = getattr(module, "create_handler", None)
-        if not callable(factory):
-            raise ToolScriptError(f"tool script missing create_handler: {path}")
-        return spec, factory(self._context)
+            tool.extras = {**(tool.extras or {}), "risk": "read"}
+        return tool
 
 
 def _load_module(path: Path, tool_name: str) -> ModuleType:

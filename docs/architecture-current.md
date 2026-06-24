@@ -24,7 +24,7 @@ CLI
 `taskboard-agent run-once` のエントリポイントである。
 
 - `.env` と環境変数から設定を読む
-- `RedmineClient`, `LiteLLMClient`, `SkillRegistry`, `ToolScriptCatalog`, `TaskOrchestrator`, `TicketConversationGraph` を組み立てる
+- `RedmineClient`, `LiteLLMClient`, `ChatLiteLLM`, `SkillRegistry`, `ToolScriptCatalog`, `TaskOrchestrator`, `TicketConversationGraph` を組み立てる
 - `--dry-run` では `InMemorySaver` を使う
 - 通常実行ではSQLite Checkpointerを使う
 
@@ -64,14 +64,14 @@ LangGraphによるチケット単位の会話状態管理を担当する。
 
 現在の大きな構造的特徴は、`TaskOrchestrator._execute_steps()` がstep列をまとめて実行している点である。LangGraphから見ると、step実行の途中経過は1つのノード内部の処理になっている。
 
-### `ToolRegistry` / `FunctionCallingAgent`
+### LangChain Tool / `LangChainAgentRunner`
 
-現在のtool定義とfunction calling loopは自前実装である。
+現在のtool定義とfunction calling loopはLangChain/LangGraph標準へ寄せている。
 
-- `tool_scripts/{tool_name}.py` が `TOOL_SPEC` と `create_handler(context)` を公開する
-- `ToolScriptCatalog` が必要なtoolだけを読み込み、`ToolRegistry` を組み立てる
-- `FunctionCallingAgent` がLiteLLMにtool schemaを渡し、tool callを受け取り、`ToolRegistry.execute()` で実行する
-- `risk` によってwrite toolや承認必須toolを制御する
+- `tool_scripts/{tool_name}.py` が `create_tool(context)` を公開し、LangChain `@tool`、型注釈、docstringでtool schemaを定義する
+- `ToolScriptCatalog` が必要なtoolだけを読み込み、LangChain `BaseTool` を返す
+- `LangChainAgentRunner` が `langchain.agents.create_agent()` を使い、tool call loopとtool実行をLangGraphベースのagent harnessへ委譲する
+- `BaseTool.extras` の `risk` によってwrite toolや承認必須toolを制御する
 - `--dry-run` では書き込みを抑止する
 
 ## 現在の制約
@@ -79,7 +79,7 @@ LangGraphによるチケット単位の会話状態管理を担当する。
 - stepごとの状態はLangGraph stateとして十分に表現されていない
 - step完了ごとのcheckpointではなく、まとまった実行結果として保存されやすい
 - `completed_steps` は存在するが、step実行管理の中心にはなっていない
-- LangGraphの `ToolNode` やLangChain Toolへはまだ寄せていない
+- step列そのものの実行ループはまだLangGraphノード遷移へ移っていない
 - Redmine更新責務は `workflow.py` にあり、LangGraphノードから直接Redmine APIを更新しない
 
 ## 維持する前提
