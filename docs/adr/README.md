@@ -82,7 +82,7 @@ Accepted
 
 ## Initial Records
 
-- [ADR-0001: Use a self-managed orchestrator](0001-use-self-managed-orchestrator.md)
-- [ADR-0002: Use Redmine REST API from Python instead of Redmine MCP](0002-use-redmine-rest-api-not-mcp.md)
-- [ADR-0003: Keep README as the first-read entrypoint](0003-keep-readme-as-entrypoint.md)
-- [ADR-0004: Evolve LangGraph to step-level execution state](0004-evolve-langgraph-to-step-execution.md)
+- [ADR-0001: 自前管理のオーケストレーターを使う](0001-use-self-managed-orchestrator.md)
+- [ADR-0002: Redmine MCPではなくPythonからRedmine REST APIを使う](0002-use-redmine-rest-api-not-mcp.md)
+- [ADR-0003: READMEを最初に読む入口として維持する](0003-keep-readme-as-entrypoint.md)
+- [ADR-0004: LangGraphをステップ単位の実行状態へ発展させる](0004-evolve-langgraph-to-step-execution.md)
