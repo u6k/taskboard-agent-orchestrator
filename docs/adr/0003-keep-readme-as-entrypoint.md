@@ -6,32 +6,32 @@ Accepted
 
 ## Context
 
-The original README contained project purpose, background, current behavior, detailed architecture, implementation plans, risks, and long-form design notes in one file.
+以前のREADMEには、プロジェクトの目的、背景、現在の挙動、詳細なアーキテクチャ、実装計画、リスク、長い設計メモが1つのファイルにまとまっていた。
 
-That made the README useful as a full design dump but less useful as the first document a new reader should open. The project also needs stable places for architecture, roadmap, use cases, and agent-specific development guidance.
+その状態は、設計情報をまとめて読むには便利だったが、新しく読む人が最初に開く文書としては重すぎた。また、このプロジェクトには、アーキテクチャ、ロードマップ、ユースケース、エージェント向け開発ガイドを置く安定した場所が必要である。
 
 ## Decision
 
-Keep `README.md` focused on first-read information:
+`README.md` は、最初に読むための情報に集中させる。
 
-- project purpose
-- current capabilities
-- basic repository structure
-- setup
-- execution commands
-- links to deeper documents
+- プロジェクトの目的
+- 現在できること
+- 基本的なリポジトリ構成
+- セットアップ
+- 実行コマンド
+- 詳細文書へのリンク
 
-Move architecture, design, roadmap, use cases, and agent development guidance into `docs/` and `AGENTS.md`.
+アーキテクチャ、設計、ロードマップ、ユースケース、エージェント開発ガイドは `docs/` と `AGENTS.md` に移す。
 
 ## Consequences
 
-New readers can understand the project quickly from README. Detailed design has clearer ownership and can grow without making README hard to scan.
+新しく読む人は、READMEからプロジェクトの概要を短時間で理解できる。詳細設計は置き場所が明確になり、READMEの見通しを悪くせずに育てられる。
 
-Maintainers must keep documentation links current. Detailed design should not be added back into README when a more specific document exists.
+保守者は、文書間リンクを最新に保つ必要がある。より具体的な文書が存在する場合、詳細設計をREADMEへ戻して追加しない。
 
 ## Alternatives Considered
 
-- Keep all design information in README.
-  - Not selected because it makes README too long and mixes user-facing and implementer-facing information.
-- Put all documentation under `docs/` and leave README minimal.
-  - Not selected because README should still provide enough context to set up and run the project.
+- すべての設計情報をREADMEに残す。
+  - READMEが長くなりすぎ、利用者向け情報と実装者向け情報が混ざるため採用しない。
+- すべての文書を `docs/` 以下に置き、READMEを最小限にする。
+  - READMEには、プロジェクトをセットアップして実行するための文脈を十分に残すべきであるため採用しない。
