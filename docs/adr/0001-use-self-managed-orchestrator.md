@@ -6,25 +6,25 @@ Accepted
 
 ## Context
 
-This project needs to coordinate taskboard state, human review, tool permissions, dry-run behavior, skill execution, progress comments, and durable execution history.
+このプロジェクトでは、タスクボードの状態、人間によるレビュー、tool権限、dry-runの扱い、スキル実行、進捗コメント、永続的な実行履歴を一貫して制御する必要がある。
 
-An external execution platform such as OpenClaw could provide an execution runtime, but the core problem in this project is not only running an agent. The project must preserve business-level control over how tickets are selected, how work is planned, when Redmine is updated, when a human must decide, and how execution resumes after feedback.
+OpenClawのような外部実行基盤を使えば、エージェントを実行するためのランタイムは得られる。しかし、このプロジェクトの中核課題は単にエージェントを動かすことではない。どのチケットを選ぶか、作業をどう計画するか、いつRedmineを更新するか、どの場面で人間の判断を求めるか、フィードバック後にどう再開するかを、業務ルールとして明示的に制御できる必要がある。
 
 ## Decision
 
-Use a self-managed orchestrator as the primary control layer.
+主要な制御層として、自前管理のオーケストレーターを使う。
 
-LangGraph is used inside this orchestrator for durable ticket conversations and, over time, step-level execution state. OpenClaw is not adopted as the execution foundation.
+このオーケストレーターの内部でLangGraphを使い、チケット単位の永続的な会話状態を扱う。将来的には、ステップ単位の実行状態もLangGraphで扱う。OpenClawは実行基盤として採用しない。
 
 ## Consequences
 
-The project keeps direct control over workflow rules, Redmine updates, dry-run handling, permission checks, checkpoint structure, and human-in-the-loop behavior.
+この方針により、ワークフロールール、Redmine更新、dry-runの扱い、権限チェック、チェックポイント構造、人間参加型の判断フローを、このリポジトリ内で直接制御できる。
 
-This increases implementation responsibility inside this repository. Scheduling, recovery, step execution, and tool policy must be designed and tested here instead of delegated to an external runtime.
+一方で、このリポジトリが負う実装責任は増える。スケジューリング、復旧、ステップ実行、toolポリシーは外部ランタイムに委譲せず、ここで設計しテストする必要がある。
 
 ## Alternatives Considered
 
-- Use OpenClaw as the execution foundation.
-  - Not selected because it would move too much workflow control outside this repository while the project still needs explicit taskboard, review, and permission semantics.
-- Use only one-shot LLM calls without an orchestrator.
-  - Not selected because the target workflow requires durable state, feedback handling, and restartable multi-step execution.
+- OpenClawを実行基盤として使う。
+  - タスクボード、レビュー、権限の意味づけを明示的に扱う必要がある段階で、ワークフロー制御の多くがリポジトリ外へ移るため採用しない。
+- オーケストレーターを使わず、単発のLLM呼び出しだけで実行する。
+  - 目標とするワークフローには、永続状態、フィードバック対応、再開可能な複数ステップ実行が必要なため採用しない。

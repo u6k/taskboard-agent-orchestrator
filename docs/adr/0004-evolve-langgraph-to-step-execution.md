@@ -6,15 +6,15 @@ Accepted
 
 ## Context
 
-The current implementation uses LangGraph for ticket-level conversation state, checkpointing, feedback ingestion, and revision flow. However, the actual task steps are still executed inside `TaskOrchestrator._execute_steps()` as a Python for loop.
+現在の実装では、LangGraphをチケット単位の会話状態、チェックポイント、フィードバック取り込み、修正フローに使っている。しかし、実際のタスクステップはまだ `TaskOrchestrator._execute_steps()` のPython forループ内で実行されている。
 
-This means LangGraph sees the larger execution node, but not each individual step as a checkpointed state transition. For long-running or multi-step work, the project needs clearer visibility into which step is pending, running, completed, failed, skipped, or waiting for a human.
+つまり、LangGraphから見えるのは大きな実行ノードであり、各ステップがチェックポイント付きの状態遷移としては見えていない。長時間実行や複数ステップの作業では、どのステップが未着手、実行中、完了、失敗、スキップ、人間待ちなのかをより明確に見えるようにする必要がある。
 
 ## Decision
 
-Evolve LangGraph from a coarse ticket conversation wrapper into the step-level execution state machine.
+LangGraphを、粗いチケット会話のラッパーから、ステップ単位の実行状態機械へ発展させる。
 
-The target graph should store planned steps and route execution through nodes such as:
+目標とするグラフでは、計画済みステップを状態として保持し、次のようなノードを通して実行を進める。
 
 - `plan`
 - `publish_plan`
@@ -26,17 +26,17 @@ The target graph should store planned steps and route execution through nodes su
 - `finalize_failed`
 - `wait_for_human`
 
-`TaskOrchestrator` should keep plan creation and one-step execution helpers, but LangGraph should eventually own the step loop and checkpoint step results.
+`TaskOrchestrator` には計画作成と1ステップ実行のヘルパーを残す。ただし最終的には、ステップのループとステップ結果のチェックポイントはLangGraphが担う。
 
 ## Consequences
 
-The system will be able to checkpoint after individual steps, inspect progress from graph state, resume from unfinished work, and reason about human feedback against specific completed or failed steps.
+システムは、個別ステップごとにチェックポイントを作成し、グラフ状態から進捗を確認し、未完了の作業から再開し、特定の完了ステップや失敗ステップに対する人間のフィードバックを扱えるようになる。
 
-The migration must be phased. First add step state, then extract one-step execution, then move the loop into LangGraph. A single large rewrite would make existing Redmine update behavior and revision handling too easy to break.
+移行は段階的に行う必要がある。まずステップ状態を追加し、次に1ステップ実行を切り出し、その後にループをLangGraphへ移す。一度に大きく書き換えると、既存のRedmine更新や修正フローを壊しやすい。
 
 ## Alternatives Considered
 
-- Keep step execution entirely inside `TaskOrchestrator._execute_steps()`.
-  - Not selected because it hides progress from LangGraph and limits restartability.
-- Move all tool execution directly to LangGraph `ToolNode` immediately.
-  - Not selected because the project first needs stable step state and business policy boundaries. ToolNode migration can be evaluated later, starting with low-risk read tools.
+- ステップ実行をすべて `TaskOrchestrator._execute_steps()` の中に残す。
+  - LangGraphから進捗が見えにくく、再開可能性も制限されるため採用しない。
+- すべてのtool実行をすぐにLangGraphの `ToolNode` へ移す。
+  - まず安定したステップ状態と業務ポリシー境界が必要であるため採用しない。ToolNodeへの移行は、低リスクな読み取りtoolから後で評価する。

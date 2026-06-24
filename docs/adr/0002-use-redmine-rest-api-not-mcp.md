@@ -6,25 +6,25 @@ Accepted
 
 ## Context
 
-Redmine is the initial taskboard for this project. The agent must search assigned issues, fetch issue details and journals, add comments, update statuses, and reassign tickets.
+Redmineは、このプロジェクトで最初に使うタスクボードである。エージェントは、担当チケットの検索、チケット詳細と履歴の取得、コメント追加、ステータス更新、担当者変更を行う必要がある。
 
-There was a possible direction to use a Redmine MCP integration. The current implementation already has Python clients and `tool_scripts` that operate through Redmine APIs, and the desired control model keeps taskboard operations inside the orchestrator boundary.
+Redmine MCP連携を使う案も考えられた。しかし現在の実装には、Redmine APIを呼び出すPythonクライアントと `tool_scripts` が既にある。また、目指す制御モデルでは、タスクボード操作をオーケストレーターの管理境界内に置く必要がある。
 
 ## Decision
 
-Operate Redmine through Python code that calls the Redmine REST API.
+Redmine REST APIを呼び出すPythonコードでRedmineを操作する。
 
-Do not introduce Redmine MCP as the taskboard integration mechanism. Redmine-specific operations remain in `RedmineClient`, workflow code, and explicit Python tools.
+タスクボード連携の仕組みとしてRedmine MCPは導入しない。Redmine固有の操作は、`RedmineClient`、ワークフローコード、明示的なPython toolに残す。
 
 ## Consequences
 
-The orchestrator can enforce dry-run behavior, write policies, status transitions, assignee rules, and audit behavior before making Redmine changes.
+オーケストレーターは、Redmineを変更する前に、dry-runの扱い、書き込みポリシー、ステータス遷移、担当者ルール、監査用の挙動を強制できる。
 
-The project owns more integration code and must maintain Redmine API request and response handling. If another taskboard is added later, the right direction is a taskboard adapter abstraction, not introducing Redmine MCP as a special control path.
+その代わり、このプロジェクトが保持する連携コードは増え、Redmine APIのリクエストとレスポンス処理を保守する必要がある。将来ほかのタスクボードを追加する場合は、Redmine MCPを特別な制御経路として導入するのではなく、タスクボードアダプターの抽象化を検討する。
 
 ## Alternatives Considered
 
-- Use Redmine MCP.
-  - Not selected because the project wants Redmine updates to remain under explicit Python workflow and policy control.
-- Keep Redmine operations only inside generic LLM-selected tools.
-  - Not selected for core workflow updates because status and assignee transitions are business rules and should not depend on unconstrained tool selection.
+- Redmine MCPを使う。
+  - Redmine更新は、明示的なPythonワークフローとポリシー制御の下に置きたいため採用しない。
+- Redmine操作を、LLMが選択する汎用toolの中だけに置く。
+  - ステータス遷移や担当者変更は業務ルールであり、制約の弱いtool選択に依存させるべきではないため、主要なワークフロー更新では採用しない。
