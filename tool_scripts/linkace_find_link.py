@@ -2,29 +2,28 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain.tools import tool
+from langchain_core.tools import BaseTool
+
 from taskboard_agent.tool_loader import ToolRuntimeContext
-from taskboard_agent.tools import ToolSpec
 
 
 SOURCE_LIST_ID = 1
 
-TOOL_SPEC = ToolSpec(
-    name="linkace_find_link",
-    description="指定URLがLinkAceに登録済みか確認する。",
-    parameters={
-        "type": "object",
-        "properties": {"url": {"type": "string"}},
-        "required": ["url"],
-        "additionalProperties": False,
-    },
-    risk="read",
-)
 
-
-def create_handler(context: ToolRuntimeContext) -> Any:
+def create_tool(context: ToolRuntimeContext) -> BaseTool:
     bookmark_client = context.require_service("bookmark_client")
 
-    def handle(*, url: str) -> dict[str, Any]:
+    @tool(
+        parse_docstring=True,
+        extras={"risk": "read", "planner_visible": True},
+    )
+    def linkace_find_link(url: str) -> dict[str, Any]:
+        """指定URLがLinkAceに登録済みか確認する。
+
+        Args:
+            url: LinkAce内で検索するURL。
+        """
         if context.dry_run:
             return {
                 "ok": True,
@@ -44,7 +43,7 @@ def create_handler(context: ToolRuntimeContext) -> Any:
             "bookmark": _existing_bookmark(bookmark) if bookmark else None,
         }
 
-    return handle
+    return linkace_find_link
 
 
 def _existing_bookmark(bookmark: Any) -> dict[str, Any]:

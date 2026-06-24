@@ -4,8 +4,10 @@ import json
 import re
 from typing import Any
 
+from langchain.tools import tool
+from langchain_core.tools import BaseTool
+
 from taskboard_agent.tool_loader import ToolRuntimeContext
-from taskboard_agent.tools import ToolSpec
 
 
 MAX_INPUT_CHARS = 200_000
@@ -29,27 +31,21 @@ SYSTEM_PROMPT = """あなたは日本語の週次業務報告書を管理職向�
 - 情報がなければ、配列は空、単一値は null を返す。
 """
 
-TOOL_SPEC = ToolSpec(
-    name="summarize_weekly_docx",
-    description="DOCXから抽出された週報本文をLLMで分析し、管理職向けMarkdownサマリーを生成する。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "filename": {"type": "string"},
-            "text": {"type": "string"},
-        },
-        "required": ["filename", "text"],
-        "additionalProperties": False,
-    },
-    risk="read",
-    planner_visible=False,
-)
 
-
-def create_handler(context: ToolRuntimeContext) -> Any:
+def create_tool(context: ToolRuntimeContext) -> BaseTool:
     llm = context.require_service("llm")
 
-    def handle(*, filename: str, text: str) -> dict[str, Any]:
+    @tool(
+        parse_docstring=True,
+        extras={"risk": "read", "planner_visible": False},
+    )
+    def summarize_weekly_docx(filename: str, text: str) -> dict[str, Any]:
+        """DOCXから抽出された週報本文をLLMで分析し、管理職向けMarkdownサマリーを生成する。
+
+        Args:
+            filename: 要約対象のDOCXファイル名。
+            text: DOCXから抽出した本文。
+        """
         if not text.strip():
             return {"ok": False, "filename": filename, "error": "抽出本文が空です。"}
         if len(text) > MAX_INPUT_CHARS:
@@ -82,7 +78,7 @@ def create_handler(context: ToolRuntimeContext) -> Any:
             return {"ok": False, "filename": filename, "error": str(exc)}
         return {"ok": True, "filename": filename, "summary": summary, "report": report}
 
-    return handle
+    return summarize_weekly_docx
 
 
 def _response_format() -> dict[str, Any]:
@@ -196,9 +192,17 @@ def _render_markdown(filename: str, report: dict[str, Any]) -> str:
                 "| 案件名 | 作業名 | 概況 | 進捗 |",
                 "| --- | --- | --- | --- |",
                 *[
-                    "| " + " | ".join(_cell(row[key]) for key in (
-                        "project_name", "task_name", "overview", "progress"
-                    )) + " |"
+                    "| "
+                    + " | ".join(
+                        _cell(row[key])
+                        for key in (
+                            "project_name",
+                            "task_name",
+                            "overview",
+                            "progress",
+                        )
+                    )
+                    + " |"
                     for row in project_status
                 ],
             ]
@@ -213,9 +217,16 @@ def _render_markdown(filename: str, report: dict[str, Any]) -> str:
                 "| 案件名 | 障害・ネガティブ情報 | 対応状況 |",
                 "| --- | --- | --- |",
                 *[
-                    "| " + " | ".join(_cell(row[key]) for key in (
-                        "project_name", "information", "response_status"
-                    )) + " |"
+                    "| "
+                    + " | ".join(
+                        _cell(row[key])
+                        for key in (
+                            "project_name",
+                            "information",
+                            "response_status",
+                        )
+                    )
+                    + " |"
                     for row in negative_information
                 ],
             ]
@@ -223,8 +234,7 @@ def _render_markdown(filename: str, report: dict[str, Any]) -> str:
     else:
         lines.append("記載なし。")
     lines.extend(["", "## 営業情報", ""])
-    sales_information = report["sales_information"]
-    lines.extend(f"- {item}" for item in sales_information or ["特になし"])
+    lines.extend(f"- {item}" for item in sales_information_or_none(report))
     lines.extend(
         [
             "",
@@ -234,6 +244,11 @@ def _render_markdown(filename: str, report: dict[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def sales_information_or_none(report: dict[str, Any]) -> list[str]:
+    sales_information = report["sales_information"]
+    return sales_information or ["特になし"]
 
 
 def _cell(value: str) -> str:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain.tools import tool
+from langchain_core.tools import BaseTool
+
 from taskboard_agent.tool_loader import ToolRuntimeContext
-from taskboard_agent.tools import ToolSpec
 
 
 BRIEFING_PROMPT = (
@@ -15,27 +17,22 @@ BRIEFING_PROMPT = (
 )
 MAX_INPUT_CHARS = 60000
 
-TOOL_SPEC = ToolSpec(
-    name="summarize_briefing",
-    description="Webページ本文をブリーフィング要約する。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "url": {"type": "string"},
-            "title": {"type": "string"},
-            "text": {"type": "string"},
-        },
-        "required": ["url", "title", "text"],
-        "additionalProperties": False,
-    },
-    risk="read",
-)
 
-
-def create_handler(context: ToolRuntimeContext) -> Any:
+def create_tool(context: ToolRuntimeContext) -> BaseTool:
     llm = context.require_service("llm")
 
-    def handle(*, url: str, title: str, text: str) -> dict[str, Any]:
+    @tool(
+        parse_docstring=True,
+        extras={"risk": "read", "planner_visible": True},
+    )
+    def summarize_briefing(url: str, title: str, text: str) -> dict[str, Any]:
+        """Webページ本文をブリーフィング要約する。
+
+        Args:
+            url: 要約元ページのURL。
+            title: 要約元ページのタイトル。
+            text: 要約対象の抽出本文。
+        """
         try:
             response = llm.complete(
                 [
@@ -62,7 +59,7 @@ def create_handler(context: ToolRuntimeContext) -> Any:
             }
         return {"ok": True, "url": url, "title": title, "briefing": briefing}
 
-    return handle
+    return summarize_briefing
 
 
 def _build_prompt(*, url: str, title: str, text: str) -> str:

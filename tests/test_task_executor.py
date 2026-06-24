@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from langchain_core.tools import BaseTool, StructuredTool
 
 from taskboard_agent.agent import AgentRunResult
 from taskboard_agent.llm import LLMResponse, LLMToolCall
@@ -18,8 +19,7 @@ from taskboard_agent.task_executor import (
     TaskPlanningError,
     parse_task_plan,
 )
-from taskboard_agent.tools import ToolRegistry, ToolRegistryError, ToolSpec
-from taskboard_agent.tools import ToolExecutionResult
+from taskboard_agent.tools import ToolExecutionError, ToolExecutionResult
 
 
 class FakeLLM:
@@ -54,21 +54,26 @@ class FakeToolCatalog:
         self.fail = fail
         self.calls: list[dict[str, Any]] = []
 
-    def registry_for(self, tool_names: tuple[str, ...] | list[str]) -> ToolRegistry:
+    def tools_for(self, tool_names: tuple[str, ...] | list[str]) -> list[BaseTool]:
         self.calls.append({"tool_names": tuple(tool_names)})
         if self.fail:
-            raise ToolRegistryError("missing tool script")
-        registry = ToolRegistry()
+            raise ToolExecutionError("missing tool script")
+        tools: list[BaseTool] = []
         for tool_name in tool_names:
-            registry.register(
-                ToolSpec(
+            def run_tool() -> dict[str, Any]:
+                """Run test tool."""
+                return {"ok": True}
+
+            tools.append(
+                StructuredTool.from_function(
+                    run_tool,
                     name=tool_name,
                     description="test tool",
-                    parameters={"type": "object", "properties": {}, "required": []},
-                ),
-                lambda **_kwargs: {"ok": True},
+                    infer_schema=True,
+                    extras={"risk": "read"},
+                )
             )
-        return registry
+        return tools
 
     def summaries(self) -> list[dict[str, Any]]:
         return [
@@ -84,22 +89,13 @@ class StepToolCatalog:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def registry_for(self, tool_names: tuple[str, ...] | list[str]) -> ToolRegistry:
+    def tools_for(self, tool_names: tuple[str, ...] | list[str]) -> list[BaseTool]:
         self.calls.append({"tool_names": tuple(tool_names)})
-        registry = ToolRegistry()
+        tools: list[BaseTool] = []
         if "web_search_pages" in tool_names:
-            registry.register(
-                ToolSpec(
-                    name="web_search_pages",
-                    description="Search pages.",
-                    parameters={
-                        "type": "object",
-                        "properties": {"query": {"type": "string"}},
-                        "required": ["query"],
-                        "additionalProperties": False,
-                    },
-                ),
-                lambda query: {
+            def web_search_pages(query: str) -> dict[str, Any]:
+                """Search pages."""
+                return {
                     "ok": True,
                     "context_artifact": {
                         "type": "web_search_pages",
@@ -125,9 +121,18 @@ class StepToolCatalog:
                             }
                         ],
                     },
-                },
+                }
+
+            tools.append(
+                StructuredTool.from_function(
+                    web_search_pages,
+                    name="web_search_pages",
+                    description="Search pages.",
+                    infer_schema=True,
+                    extras={"risk": "read"},
+                )
             )
-        return registry
+        return tools
 
     def summaries(self) -> list[dict[str, Any]]:
         return [
@@ -147,7 +152,7 @@ class FakeSkillAgent:
         self,
         messages: list[dict[str, Any]],
         *,
-        tools: ToolRegistry | None = None,
+        tools: list[BaseTool] | None = None,
         allow_writes: bool = False,
         approved_tools: set[str] | None = None,
         on_llm_response: Any | None = None,
@@ -200,7 +205,7 @@ class SearchArtifactSkillAgent:
         self,
         messages: list[dict[str, Any]],
         *,
-        tools: ToolRegistry | None = None,
+        tools: list[BaseTool] | None = None,
         allow_writes: bool = False,
         approved_tools: set[str] | None = None,
         on_llm_response: Any | None = None,
@@ -749,9 +754,8 @@ def test_orchestrator_recovers_tool_step_after_schema_failure() -> None:
 
     assert result.status == "processed"
     assert result.artifacts[0]["query"] == "openclaw"
-    assert any("失敗原因を確認" in (event.notes or "") for event in result.events)
     assert any("スキーマにない引数を除去" in (event.notes or "") for event in result.events)
-    assert len(tool_catalog.calls) == 2
+    assert len(tool_catalog.calls) == 1
 
 
 def test_orchestrator_falls_back_when_web_search_final_json_is_empty() -> None:

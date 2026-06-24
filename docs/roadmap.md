@@ -111,22 +111,24 @@
 - LangGraph stateから機械的にstep状態が追える
 - 途中失敗時の再開判断が明確になる
 
-## Phase 5: tool実行を必要に応じて標準化する
+## Phase 5: tool管理とfunction calling loopを標準化する
 
 目的:
 
-- LangChain ToolやLangGraph `ToolNode` に寄せられる部分を段階的に検証する
+- tool定義、schema生成、function calling loopをLangChain/LangGraph標準へ寄せる
 
 方針:
 
-- 最初は低リスクなread系toolだけを対象にする
+- `tool_scripts/{tool_name}.py` は `create_tool(context)` からLangChain `BaseTool` を返す
+- tool schemaは `@tool`、型注釈、docstringから生成する
+- LLMのtool call loopはLangChain `create_agent()` に委譲する
 - Redmine更新、外部書き込み、承認が必要なtoolは自前policyを維持する
-- ToolRegistryをいきなり全廃しない
 - tool catalogとtool policyは業務制御レイヤーとして残す
 
 完了条件:
 
-- 少なくとも1つのread系toolで標準tool実行を検証できる
+- 既存toolがLangChain `BaseTool` として定義されている
+- 汎用tool/skill実行のfunction calling loopがLangChain/LangGraph agent harnessで動く
 - dry-run、write禁止、人間承認の制御が壊れていない
 - 既存スキル実行が維持されている
 

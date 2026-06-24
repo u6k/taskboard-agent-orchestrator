@@ -4,28 +4,41 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from langchain_core.tools import BaseTool, StructuredTool
+
 from taskboard_agent.llm import LLMResponse
 from taskboard_agent.skill_runtime import ScriptedSkillRunner
 from taskboard_agent.skills import SkillRegistry
 from taskboard_agent.tool_loader import ToolRuntimeContext, ToolScriptCatalog
-from taskboard_agent.tools import ToolRegistry, ToolSpec
+from taskboard_agent.tools import execute_tool
 
 
 ROOT = Path(__file__).parents[1]
 
 
-def _registry(handlers: dict[str, Callable[..., dict[str, Any]]]) -> ToolRegistry:
-    registry = ToolRegistry()
-    for name, handler in handlers.items():
-        registry.register(
-            ToolSpec(
-                name=name,
-                description=name,
-                parameters={"type": "object", "properties": {}},
-            ),
+def _tools(handlers: dict[str, Callable[..., dict[str, Any]]]) -> list[BaseTool]:
+    return [
+        StructuredTool.from_function(
             handler,
+            name=name,
+            description=name,
+            args_schema=_test_tool_schema(),
+            infer_schema=False,
+            extras={"risk": "read"},
         )
-    return registry
+        for name, handler in handlers.items()
+    ]
+
+
+def _test_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "filename": {"type": "string"},
+            "content_url": {"type": "string"},
+            "text": {"type": "string"},
+        },
+    }
 
 
 def _run(
@@ -35,7 +48,7 @@ def _run(
     dry_run: bool = False,
 ):
     skill = SkillRegistry(ROOT / "skills").get("weekly-docx-report-extractor")
-    return ScriptedSkillRunner(skill=skill, tools=_registry(handlers)).run(
+    return ScriptedSkillRunner(skill=skill, tools=_tools(handlers)).run(
         issue={"id": 123, "attachments": attachments},
         dry_run=dry_run,
     )
@@ -148,10 +161,10 @@ def test_summarize_weekly_docx_uses_strict_schema_and_renders_markdown() -> None
     registry = ToolScriptCatalog(
         ROOT / "tool_scripts",
         ToolRuntimeContext(services={"llm": llm}, settings={}),
-    ).registry_for(("summarize_weekly_docx",))
+    ).tools_for(("summarize_weekly_docx",))
 
-    result = registry.execute(
-        "summarize_weekly_docx",
+    result = execute_tool(
+        registry[0],
         {"filename": "weekly.docx", "text": "[TABLE]\n週報本文"},
     ).content
 
@@ -173,10 +186,10 @@ def test_summarize_weekly_docx_rejects_invalid_llm_response() -> None:
     registry = ToolScriptCatalog(
         ROOT / "tool_scripts",
         ToolRuntimeContext(services={"llm": llm}, settings={}),
-    ).registry_for(("summarize_weekly_docx",))
+    ).tools_for(("summarize_weekly_docx",))
 
-    result = registry.execute(
-        "summarize_weekly_docx",
+    result = execute_tool(
+        registry[0],
         {"filename": "weekly.docx", "text": "本文"},
     ).content
 
