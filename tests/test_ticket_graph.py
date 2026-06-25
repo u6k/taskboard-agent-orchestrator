@@ -246,6 +246,8 @@ def test_initial_run_creates_ticket_conversation_and_interrupts() -> None:
     assert result.status == "processed"
     assert events[0].kind == "start"
     assert "初回作業を計画しました。" in (events[0].notes or "")
+    assert SkillEvent("progress", "ステップ 1 を開始しました: チケット本文だけで対応可能") in events
+    assert SkillEvent("progress", "ステップ 1 を完了しました: チケット本文だけで対応可能") in events
     assert SkillEvent("progress", "作業結果を確認してください。") in events
     assert events[-1] == SkillEvent("final_review", "作業が終了しました。")
     state = graph.conversation_state(123)
@@ -279,7 +281,9 @@ def test_initial_plan_steps_are_saved_in_graph_state() -> None:
         ai_user_id=42,
     )
 
-    graph.run(issue=_issue())
+    events: list[SkillEvent] = []
+
+    graph.run(issue=_issue(), emit_event=events.append)
 
     state = graph.conversation_state(123)
     assert state["run_status"] == "processed"
@@ -344,6 +348,10 @@ def test_initial_plan_steps_are_saved_in_graph_state() -> None:
             "artifacts": [],
         },
     ]
+    assert SkillEvent("progress", "ステップ 1 を開始しました: 依頼内容を整理する") in events
+    assert SkillEvent("progress", "ステップ 1 を完了しました: 依頼内容を整理する") in events
+    assert SkillEvent("progress", "ステップ 2 を開始しました: 外部承認が必要な作業は実行しない") in events
+    assert SkillEvent("progress", "ステップ 2 をスキップしました: 外部承認が必要な作業は実行しない") in events
 
 
 def test_step_needs_user_keeps_stopped_step_and_pending_remainder() -> None:
@@ -368,6 +376,8 @@ def test_step_needs_user_keeps_stopped_step_and_pending_remainder() -> None:
     result = graph.run(issue=_issue(), emit_event=events.append)
 
     assert result.status == "needs_user"
+    assert SkillEvent("progress", "ステップ 1 を開始しました: 追加情報を確認する") in events
+    assert SkillEvent("progress", "ステップ 1 を判断待ちで停止しました: 追加情報を確認する") in events
     assert events[-1] == SkillEvent("final_review", "計画した作業ステップの実行を終了しました。")
     state = graph.conversation_state(123)
     assert state["current_step_index"] == 0
@@ -378,6 +388,42 @@ def test_step_needs_user_keeps_stopped_step_and_pending_remainder() -> None:
     ]
     assert state["step_results"][0]["status"] == "needs_user"
     assert state["last_result"]["status"] == "needs_user"
+
+
+def test_step_failure_is_recorded_as_progress_and_keeps_resume_position() -> None:
+    graph = TicketConversationGraph(
+        task_orchestrator=FakeOrchestrator(  # type: ignore[arg-type]
+            plan=TaskPlan(
+                decision="no_skill",
+                reason="本文を確認して回答する",
+                steps=(
+                    TaskStep(kind="llm", purpose="外部サービスを確認する"),
+                    TaskStep(kind="llm", purpose="回答を作成する"),
+                ),
+            ),
+            step_statuses=["failed"],
+        ),
+        llm=FakeLLM([]),
+        checkpointer=InMemorySaver(),
+        ai_user_id=42,
+    )
+    events: list[SkillEvent] = []
+
+    result = graph.run(issue=_issue(), emit_event=events.append)
+
+    assert result.status == "failed"
+    assert SkillEvent("progress", "ステップ 1 を開始しました: 外部サービスを確認する") in events
+    assert SkillEvent("progress", "ステップ 1 を失敗しました: 外部サービスを確認する") in events
+    assert events[-1] == SkillEvent("final_return", "計画した作業ステップの実行を終了しました。")
+    state = graph.conversation_state(123)
+    assert state["current_step_index"] == 0
+    assert state["run_status"] == "failed"
+    assert [step["status"] for step in state["plan_steps"]] == [
+        "failed",
+        "pending",
+    ]
+    assert state["step_results"][0]["status"] == "failed"
+    assert state["last_result"]["status"] == "failed"
 
 
 def test_resume_adds_only_new_human_comment_and_publishes_revision_first() -> None:
