@@ -86,6 +86,21 @@ class TaskPlan:
     limitations: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class TaskStepExecution:
+    index: int
+    step: TaskStep
+    result: SkillExecutionResult
+    events: tuple[SkillEvent, ...]
+    artifacts: tuple[dict[str, Any], ...] = ()
+    context_messages: tuple[dict[str, Any], ...] = ()
+    terminal_status: str | None = None
+
+    @property
+    def should_stop(self) -> bool:
+        return self.terminal_status is not None
+
+
 class LiteLLMTaskPlanner:
     def __init__(self, llm: TaskLLMPort) -> None:
         self._llm = llm
@@ -459,54 +474,19 @@ class TaskOrchestrator:
         )
 
         for index, step in enumerate(plan.steps, 1):
-            if step.kind == "unavailable":
-                events.append(
-                    SkillEvent(
-                        "progress",
-                        f"未実行の作業 {index}: {step.purpose}",
-                    )
-                )
-                continue
-            try:
-                if step.kind == "llm":
-                    result = self._run_llm_step(
-                        issue=issue,
-                        step=step,
-                        plan=plan,
-                        dry_run=dry_run,
-                        step_context=step_context,
-                    )
-                elif step.kind == "tool":
-                    result = self._run_tool_step(
-                        issue=issue,
-                        step=step,
-                        plan=plan,
-                        dry_run=dry_run,
-                        step_context=step_context,
-                    )
-                else:
-                    result = self._run_skill_step(issue=issue, step=step, dry_run=dry_run)
-            except Exception as exc:
-                result = _step_exception_result(step, exc, dry_run=dry_run)
-
-            if result.status in ("failed", "missing_tool", "needs_user"):
-                result = self._recover_step_failure(
-                    issue=issue,
-                    step=step,
-                    plan=plan,
-                    dry_run=dry_run,
-                    step_context=step_context,
-                    failed_result=result,
-                )
-
-            events.extend(_step_events(index, step, result))
-            artifacts.extend(result.artifacts)
-            step_context.extend(_result_context_messages(index, step, result))
-            if result.status in ("failed", "missing_tool"):
-                status = result.status
-                break
-            if result.status == "needs_user":
-                status = "needs_user"
+            execution = self.execute_single_step(
+                issue=issue,
+                plan=plan,
+                step=step,
+                step_index=index,
+                dry_run=dry_run,
+                step_context=step_context,
+            )
+            events.extend(execution.events)
+            artifacts.extend(execution.artifacts)
+            step_context.extend(execution.context_messages)
+            if execution.should_stop:
+                status = execution.terminal_status or status
                 break
 
         final_notes = _step_final_notes(plan=plan, status=status)
@@ -519,6 +499,86 @@ class TaskOrchestrator:
             events=tuple(events),
             artifacts=tuple(artifacts),
             dry_run=dry_run,
+        )
+
+    def execute_single_step(
+        self,
+        *,
+        issue: dict[str, Any],
+        plan: TaskPlan,
+        step: TaskStep,
+        step_index: int,
+        dry_run: bool = False,
+        step_context: list[dict[str, Any]] | None = None,
+    ) -> TaskStepExecution:
+        if step_index < 1:
+            raise ValueError("step_index must be 1-based")
+        active_context = list(step_context or [])
+        if step.kind == "unavailable":
+            result = SkillExecutionResult(
+                status="skipped",
+                events=(),
+                dry_run=dry_run,
+            )
+            return TaskStepExecution(
+                index=step_index,
+                step=step,
+                result=result,
+                events=(
+                    SkillEvent(
+                        "progress",
+                        f"未実行の作業 {step_index}: {step.purpose}",
+                    ),
+                ),
+            )
+
+        try:
+            if step.kind == "llm":
+                result = self._run_llm_step(
+                    issue=issue,
+                    step=step,
+                    plan=plan,
+                    dry_run=dry_run,
+                    step_context=active_context,
+                )
+            elif step.kind == "tool":
+                result = self._run_tool_step(
+                    issue=issue,
+                    step=step,
+                    plan=plan,
+                    dry_run=dry_run,
+                    step_context=active_context,
+                )
+            else:
+                result = self._run_skill_step(issue=issue, step=step, dry_run=dry_run)
+        except Exception as exc:
+            result = _step_exception_result(step, exc, dry_run=dry_run)
+
+        if result.status in ("failed", "missing_tool", "needs_user"):
+            result = self._recover_step_failure(
+                issue=issue,
+                step=step,
+                plan=plan,
+                dry_run=dry_run,
+                step_context=active_context,
+                failed_result=result,
+            )
+
+        terminal_status = (
+            result.status
+            if result.status in ("failed", "missing_tool", "needs_user")
+            else None
+        )
+        return TaskStepExecution(
+            index=step_index,
+            step=step,
+            result=result,
+            events=_step_events(step_index, step, result),
+            artifacts=result.artifacts,
+            context_messages=tuple(
+                _result_context_messages(step_index, step, result)
+            ),
+            terminal_status=terminal_status,
         )
 
     def _run_tool_step(
