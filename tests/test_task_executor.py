@@ -19,6 +19,7 @@ from taskboard_agent.task_executor import (
     TaskPlanningError,
     parse_task_plan,
 )
+from taskboard_agent.structured_output import task_plan_response_format
 from taskboard_agent.tools import ToolExecutionError, ToolExecutionResult
 
 
@@ -374,6 +375,41 @@ def test_parse_task_plan_reads_steps_and_limitations() -> None:
     assert plan.limitations == ("社内規程への適合は未確認",)
 
 
+def test_parse_task_plan_repairs_empty_step_purpose_from_task_input() -> None:
+    plan = parse_task_plan(
+        '{"decision":"use_skill","reason":"対象記事を要約して登録する",'
+        '"skill_name":"web-briefing-bookmark","tool_names":[],"target_url":null,'
+        '"task_input":{"instruction":"指定URLの記事を要約してブックマーク登録する",'
+        '"target_url":"https://example.test/article"},'
+        '"user_request":null,'
+        '"steps":[{"kind":"skill","name":"web-briefing-bookmark","purpose":"",'
+        '"arguments":{"target_url":"https://example.test/article"}}],'
+        '"limitations":[]}'
+    )
+
+    assert plan.steps == (
+        TaskStep(
+            kind="skill",
+            name="web-briefing-bookmark",
+            purpose="指定URLの記事を要約してブックマーク登録する",
+            arguments={"target_url": "https://example.test/article"},
+        ),
+    )
+
+
+def test_parse_task_plan_repairs_empty_step_purpose_from_reason() -> None:
+    plan = parse_task_plan(
+        '{"decision":"use_tools","reason":"検索結果を取得する",'
+        '"skill_name":null,"tool_names":["web_search_pages"],"target_url":null,'
+        '"task_input":null,"user_request":null,'
+        '"steps":[{"kind":"tool","name":"web_search_pages","purpose":"   ",'
+        '"arguments":{"query":"生成AI"}}],'
+        '"limitations":[]}'
+    )
+
+    assert plan.steps[0].purpose == "検索結果を取得する"
+
+
 def test_parse_task_plan_rejects_invalid_decision() -> None:
     with pytest.raises(TaskPlanningError, match="decision"):
         parse_task_plan('{"decision": "bad", "reason": "x"}')
@@ -467,6 +503,39 @@ def test_task_planner_includes_available_skills_in_prompt() -> None:
     assert "task_input" in response_format["json_schema"]["schema"]["properties"]
     assert "JSON objectだけ" not in llm.messages[0][1]["content"]
     assert "依頼目的全体と一致するskillがある場合" in llm.messages[0][1]["content"]
+
+
+def test_task_plan_schema_marks_core_text_fields_non_empty() -> None:
+    schema = task_plan_response_format(
+        skill_names=["web-briefing-bookmark"],
+        tool_names=["web_search_pages"],
+    )["json_schema"]["schema"]
+
+    assert schema["properties"]["reason"]["minLength"] == 1
+    step_schema = schema["properties"]["steps"]["items"]
+    assert step_schema["properties"]["purpose"]["minLength"] == 1
+
+
+def test_task_planner_retry_prompt_includes_field_specific_repair_hint() -> None:
+    invalid = (
+        '{"decision":"use_tools","reason":"x",'
+        '"skill_name":null,"tool_names":["unknown"],"target_url":null,'
+        '"task_input":null,"user_request":null,'
+        '"steps":[{"kind":"tool","name":"unknown","purpose":"調べる","arguments":null}],'
+        '"limitations":[]}'
+    )
+    llm = FakeLLM([invalid, invalid, invalid])
+
+    with pytest.raises(TaskPlanningError, match="after 3 attempts"):
+        LiteLLMTaskPlanner(llm).plan(
+            _issue(),
+            [],
+            [{"name": "web_search_pages", "description": "検索"}],
+        )
+
+    retry_prompt = llm.messages[1][-1]["content"]
+    assert "修正指示:" in retry_prompt
+    assert "空文字ではなく" in retry_prompt
 
 
 def test_task_planner_asks_llm_to_validate_explicit_skill_against_request() -> None:

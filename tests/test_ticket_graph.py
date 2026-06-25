@@ -9,7 +9,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from taskboard_agent.llm import LLMResponse
 from taskboard_agent.skill_runtime import SkillEvent, SkillExecutionResult
-from taskboard_agent.task_executor import TaskPlan, TaskStep
+from taskboard_agent.task_executor import TaskPlan, TaskStep, TaskStepExecution
 from taskboard_agent.ticket_graph import TicketConversationGraph
 
 
@@ -31,6 +31,7 @@ class FakeOrchestrator:
         fail_revision_once: bool = False,
         artifacts: tuple[dict[str, Any], ...] = (),
         tools: list[dict[str, Any]] | None = None,
+        step_statuses: list[str] | None = None,
     ) -> None:
         self.plan = plan or TaskPlan(
             decision="no_skill",
@@ -40,6 +41,7 @@ class FakeOrchestrator:
         self.fail_revision_once = fail_revision_once
         self.artifacts = artifacts
         self.tools = tools or []
+        self.step_statuses = list(step_statuses or [])
 
     def create_plan(self, issue: dict[str, Any]) -> TaskPlan:
         return self.plan
@@ -81,6 +83,131 @@ class FakeOrchestrator:
             artifacts=self.artifacts,
         )
 
+    def plan_notes(self, plan: TaskPlan) -> str:
+        if plan.steps:
+            step_lines = [
+                f"{index}. {step.kind}: {step.purpose}"
+                for index, step in enumerate(plan.steps, 1)
+            ]
+            return "初回作業を計画しました。\n\n作業ステップ:\n" + "\n".join(step_lines)
+        return "初回作業を計画しました。"
+
+    def step_context_messages(
+        self,
+        *,
+        issue: dict[str, Any],
+        conversation_messages: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        return [
+            *(conversation_messages or []),
+            {"role": "user", "content": f"issue={issue['id']}"},
+        ]
+
+    def step_final_event(self, *, plan: TaskPlan, status: str) -> SkillEvent:
+        kind = "final_return" if status == "failed" else "final_review"
+        return SkillEvent(kind, "計画した作業ステップの実行を終了しました。")
+
+    def execute_single_step(
+        self,
+        *,
+        issue: dict[str, Any],
+        plan: TaskPlan,
+        step: TaskStep,
+        step_index: int,
+        dry_run: bool = False,
+        step_context: list[dict[str, Any]] | None = None,
+    ) -> TaskStepExecution:
+        is_revision = any(
+            "差し戻し" in str(message.get("content", ""))
+            for message in (step_context or [])
+        )
+        self.executions.append(
+            {
+                "issue": issue,
+                "plan": plan,
+                "step": step,
+                "step_index": step_index,
+                "dry_run": dry_run,
+                "step_context": step_context,
+                "conversation_messages": step_context,
+                "announce_plan": not is_revision,
+            }
+        )
+        if self.fail_revision_once and is_revision:
+            self.fail_revision_once = False
+            raise RuntimeError("revision execution failed")
+        if step.kind == "unavailable":
+            result = SkillExecutionResult(
+                status="skipped",
+                events=(),
+                dry_run=dry_run,
+            )
+            return TaskStepExecution(
+                index=step_index,
+                step=step,
+                result=result,
+                events=(
+                    SkillEvent(
+                        "progress",
+                        f"未実行の作業 {step_index}: {step.purpose}",
+                    ),
+                ),
+            )
+        status = self.step_statuses.pop(0) if self.step_statuses else "processed"
+        if status in ("needs_user", "failed", "missing_tool"):
+            event_kind = "final_return" if status == "failed" else "final_review"
+            result = SkillExecutionResult(
+                status=status,
+                events=(SkillEvent(event_kind, "追加情報が必要です。"),),
+                dry_run=dry_run,
+            )
+            return TaskStepExecution(
+                index=step_index,
+                step=step,
+                result=result,
+                events=(
+                    SkillEvent(
+                        "progress",
+                        f"ステップ {step_index} を実行しました: {step.purpose}",
+                    ),
+                    *result.events,
+                ),
+                terminal_status=status,
+            )
+        result = SkillExecutionResult(
+            status="processed",
+            events=(SkillEvent("final_review", "作業結果を確認してください。"),),
+            target_url="https://example.test/article",
+            page_title="Article",
+            briefing="保存済みの要約本文",
+            bookmark_url="https://bookmark.test/links/1",
+            artifacts=self.artifacts,
+            dry_run=dry_run,
+        )
+        return TaskStepExecution(
+            index=step_index,
+            step=step,
+            result=result,
+            events=(SkillEvent("progress", f"ステップ {step_index} を実行しました: {step.purpose}"), *result.events),
+            artifacts=self.artifacts,
+            context_messages=(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"ステップ {step_index} 実行結果:\n"
+                        "保存済みの要約本文"
+                    ),
+                },
+                *(
+                    {
+                        "role": "assistant",
+                        "content": f"ステップ {step_index} 成果JSON:\n{artifact}",
+                    }
+                    for artifact in self.artifacts
+                ),
+            ),
+        )
+
 
 def _issue(*, journals: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {
@@ -117,12 +244,10 @@ def test_initial_run_creates_ticket_conversation_and_interrupts() -> None:
     result = graph.run(issue=_issue(), emit_event=events.append)
 
     assert result.status == "processed"
-    assert [event.notes for event in events] == [
-        "初回作業を計画しました。",
-        "作業結果を確認してください。",
-        "作業が終了しました。",
-    ]
-    assert [event.kind for event in events] == ["start", "progress", "final_review"]
+    assert events[0].kind == "start"
+    assert "初回作業を計画しました。" in (events[0].notes or "")
+    assert SkillEvent("progress", "作業結果を確認してください。") in events
+    assert events[-1] == SkillEvent("final_review", "作業が終了しました。")
     state = graph.conversation_state(123)
     assert isinstance(state["messages"][0], HumanMessage)
     assert "案内文を作成してください" in state["messages"][0].content
@@ -159,14 +284,15 @@ def test_initial_plan_steps_are_saved_in_graph_state() -> None:
     state = graph.conversation_state(123)
     assert state["run_status"] == "processed"
     assert state["current_step_index"] is None
-    assert state["step_results"] == []
-    assert state["step_context"] == {
-        "decision": "no_skill",
-        "reason": "本文を整理して回答できる",
-        "limitations": ["外部承認は未取得"],
-        "execution_model": "execute_plan",
-        "last_result_status": "processed",
-    }
+    assert [result["status"] for result in state["step_results"]] == [
+        "processed",
+        "skipped",
+    ]
+    assert state["step_context"]["decision"] == "no_skill"
+    assert state["step_context"]["reason"] == "本文を整理して回答できる"
+    assert state["step_context"]["limitations"] == ["外部承認は未取得"]
+    assert state["step_context"]["execution_model"] == "langgraph_step_loop"
+    assert state["step_context"]["last_result_status"] == "processed"
     assert state["plan_steps"] == [
         {
             "id": "step-1",
@@ -176,9 +302,25 @@ def test_initial_plan_steps_are_saved_in_graph_state() -> None:
             "purpose": "依頼内容を整理する",
             "arguments": {"format": "bullets"},
             "status": "completed",
-            "result": None,
+            "result": {
+                "status": "processed",
+                "target_url": "https://example.test/article",
+                "page_title": "Article",
+                "briefing": "保存済みの要約本文",
+                "bookmark_url": "https://bookmark.test/links/1",
+                "bookmark_payload": None,
+                "artifacts": [],
+                "dry_run": False,
+            },
             "error": None,
-            "artifacts": [],
+            "artifacts": [
+                {
+                    "target_url": "https://example.test/article",
+                    "page_title": "Article",
+                    "briefing": "保存済みの要約本文",
+                    "bookmark_url": "https://bookmark.test/links/1",
+                }
+            ],
         },
         {
             "id": "step-2",
@@ -188,11 +330,54 @@ def test_initial_plan_steps_are_saved_in_graph_state() -> None:
             "purpose": "外部承認が必要な作業は実行しない",
             "arguments": None,
             "status": "skipped",
-            "result": None,
+            "result": {
+                "status": "skipped",
+                "target_url": None,
+                "page_title": None,
+                "briefing": None,
+                "bookmark_url": None,
+                "bookmark_payload": None,
+                "artifacts": [],
+                "dry_run": False,
+            },
             "error": None,
             "artifacts": [],
         },
     ]
+
+
+def test_step_needs_user_keeps_stopped_step_and_pending_remainder() -> None:
+    graph = TicketConversationGraph(
+        task_orchestrator=FakeOrchestrator(  # type: ignore[arg-type]
+            plan=TaskPlan(
+                decision="no_skill",
+                reason="本文を確認して回答する",
+                steps=(
+                    TaskStep(kind="llm", purpose="追加情報を確認する"),
+                    TaskStep(kind="llm", purpose="回答を作成する"),
+                ),
+            ),
+            step_statuses=["needs_user"],
+        ),
+        llm=FakeLLM([]),
+        checkpointer=InMemorySaver(),
+        ai_user_id=42,
+    )
+    events: list[SkillEvent] = []
+
+    result = graph.run(issue=_issue(), emit_event=events.append)
+
+    assert result.status == "needs_user"
+    assert events[-1] == SkillEvent("final_review", "計画した作業ステップの実行を終了しました。")
+    state = graph.conversation_state(123)
+    assert state["current_step_index"] == 0
+    assert state["run_status"] == "needs_user"
+    assert [step["status"] for step in state["plan_steps"]] == [
+        "needs_user",
+        "pending",
+    ]
+    assert state["step_results"][0]["status"] == "needs_user"
+    assert state["last_result"]["status"] == "needs_user"
 
 
 def test_resume_adds_only_new_human_comment_and_publishes_revision_first() -> None:
@@ -218,7 +403,7 @@ def test_resume_adds_only_new_human_comment_and_publishes_revision_first() -> No
     assert result.status == "processed"
     assert events[0].kind == "start"
     assert "差し戻し内容を確認し、作業を再計画しました" in (events[0].notes or "")
-    assert events[-2] == SkillEvent("progress", "作業結果を確認してください。")
+    assert SkillEvent("progress", "作業結果を確認してください。") in events
     assert events[-1] == SkillEvent("final_review", "作業が終了しました。")
     assert orchestrator.executions[-1]["announce_plan"] is False
     assert orchestrator.executions[-1]["plan"].task_input == {
@@ -340,7 +525,7 @@ def test_resume_question_is_planned_and_executed_from_conversation() -> None:
     assert orchestrator.executions[-1]["plan"].decision == "no_skill"
     assert events[0].kind == "start"
     assert "作業を再計画しました" in (events[0].notes or "")
-    assert events[-2] == SkillEvent("progress", "作業結果を確認してください。")
+    assert SkillEvent("progress", "作業結果を確認してください。") in events
     assert events[-1] == SkillEvent("final_review", "作業が終了しました。")
     planner_messages = llm.calls[0]
     assert "保存済みの作業状態と成果物" not in str(planner_messages)

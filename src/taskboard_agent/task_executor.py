@@ -338,6 +338,32 @@ class TaskOrchestrator:
     def planning_catalog(self) -> tuple[list[Skill], list[dict[str, Any]]]:
         return self._skill_registry.list(), self._tool_catalog.summaries()
 
+    def plan_notes(self, plan: TaskPlan) -> str:
+        return _plan_notes(plan)
+
+    def step_context_messages(
+        self,
+        *,
+        issue: dict[str, Any],
+        conversation_messages: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        messages = list(conversation_messages or [])
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Redmineチケットの依頼内容:\n"
+                    f"{json.dumps(_issue_context(issue), ensure_ascii=False)}"
+                ),
+            }
+        )
+        return messages
+
+    def step_final_event(self, *, plan: TaskPlan, status: str) -> SkillEvent:
+        final_notes = _step_final_notes(plan=plan, status=status)
+        kind = "final_return" if status in ("failed",) else "final_review"
+        return SkillEvent(kind, final_notes)
+
     def execute_plan(
         self,
         *,
@@ -462,15 +488,9 @@ class TaskOrchestrator:
         events: list[SkillEvent] = [SkillEvent("start", "作業を開始します。")]
         artifacts: list[dict[str, Any]] = []
         status = "dry_run" if dry_run else "processed"
-        step_context = list(conversation_messages or [])
-        step_context.append(
-            {
-                "role": "user",
-                "content": (
-                    "Redmineチケットの依頼内容:\n"
-                    f"{json.dumps(_issue_context(issue), ensure_ascii=False)}"
-                ),
-            }
+        step_context = self.step_context_messages(
+            issue=issue,
+            conversation_messages=conversation_messages,
         )
 
         for index, step in enumerate(plan.steps, 1):
@@ -489,11 +509,7 @@ class TaskOrchestrator:
                 status = execution.terminal_status or status
                 break
 
-        final_notes = _step_final_notes(plan=plan, status=status)
-        if status in ("failed",):
-            events.append(SkillEvent("final_return", final_notes))
-        else:
-            events.append(SkillEvent("final_review", final_notes))
+        events.append(self.step_final_event(plan=plan, status=status))
         return SkillExecutionResult(
             status=status,
             events=tuple(events),
@@ -835,7 +851,13 @@ def parse_task_plan(output: str) -> TaskPlan:
     target_url = _normalize_json_null(data.get("target_url"))
     task_input = _normalize_json_null(data.get("task_input"))
     user_request = _normalize_json_null(data.get("user_request"))
-    steps = _parse_task_steps(_normalize_json_null(data.get("steps", [])))
+    steps = _parse_task_steps(
+        _normalize_json_null(data.get("steps", [])),
+        purpose_fallback=_task_step_purpose_fallback(
+            reason=reason,
+            task_input=task_input,
+        ),
+    )
     limitations = _parse_string_tuple(data.get("limitations", []), "limitations")
     if skill_name is not None and not isinstance(skill_name, str):
         raise TaskPlanningError("task plan skill_name must be a string or null")
@@ -858,7 +880,7 @@ def parse_task_plan(output: str) -> TaskPlan:
         tool_names=parsed_tool_names,
         target_url=target_url.strip() if isinstance(target_url, str) else None,
         task_input=task_input,
-        user_request=user_request.strip() if isinstance(user_request, str) else None,
+        user_request=_non_empty_str_or_none(user_request),
         steps=steps,
         limitations=limitations,
     )
@@ -1157,7 +1179,11 @@ def _clean_query_candidate(value: Any) -> str | None:
     return candidate
 
 
-def _parse_task_steps(value: Any) -> tuple[TaskStep, ...]:
+def _parse_task_steps(
+    value: Any,
+    *,
+    purpose_fallback: str | None = None,
+) -> tuple[TaskStep, ...]:
     if value is None:
         return ()
     if not isinstance(value, list):
@@ -1170,7 +1196,10 @@ def _parse_task_steps(value: Any) -> tuple[TaskStep, ...]:
         if kind not in ("skill", "tool", "llm", "unavailable"):
             raise TaskPlanningError("task plan step missing valid kind")
         purpose = item.get("purpose")
-        if not isinstance(purpose, str) or not purpose.strip():
+        if not isinstance(purpose, str):
+            raise TaskPlanningError("task plan step missing purpose")
+        normalized_purpose = purpose.strip() or purpose_fallback
+        if not normalized_purpose:
             raise TaskPlanningError("task plan step missing purpose")
         name = _normalize_json_null(item.get("name"))
         if name is not None and not isinstance(name, str):
@@ -1181,12 +1210,31 @@ def _parse_task_steps(value: Any) -> tuple[TaskStep, ...]:
         steps.append(
             TaskStep(
                 kind=kind,
-                purpose=purpose.strip(),
+                purpose=normalized_purpose,
                 name=name.strip() if isinstance(name, str) else None,
                 arguments=arguments,
             )
         )
     return tuple(steps)
+
+
+def _task_step_purpose_fallback(
+    *,
+    reason: Any,
+    task_input: Any,
+) -> str | None:
+    if isinstance(task_input, dict):
+        instruction = _non_empty_str_or_none(task_input.get("instruction"))
+        if instruction:
+            return instruction
+    return _non_empty_str_or_none(reason)
+
+
+def _non_empty_str_or_none(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 def _parse_string_tuple(value: Any, label: str) -> tuple[str, ...]:
@@ -1252,12 +1300,29 @@ def _validate_task_plan(
 
 
 def _build_plan_retry_prompt(error: TaskPlanningError) -> str:
+    repair_hint = _plan_retry_repair_hint(str(error))
     return (
         "前回の出力は次の検証エラーにより無効です。\n"
         f"- {error}\n\n"
+        f"{repair_hint}\n"
         "作業内容の判断は変えず、型と分岐の整合性だけを修正してください。\n"
+        "空文字ではなく、実行内容が分かる短い値を入れてください。\n"
         "APIで指定された出力構造と分岐条件に従って再回答してください。"
     )
+
+
+def _plan_retry_repair_hint(error: str) -> str:
+    if "step missing purpose" in error:
+        return (
+            "修正指示: 各steps[].purposeには、そのstepで実行する作業内容を説明する非空文字列を入れてください。"
+        )
+    if "missing reason" in error:
+        return "修正指示: reasonには判断理由を説明する非空文字列を入れてください。"
+    if "needs_user requires a non-empty user_request" in error:
+        return "修正指示: user_requestにはユーザーへ確認したい内容を非空文字列で入れてください。"
+    if "requires name" in error:
+        return "修正指示: skill/toolステップのnameには、利用可能一覧にある機械名を正確に入れてください。"
+    return "修正指示: エラーに示されたフィールドを、空文字や矛盾がない有効な値へ修正してください。"
 
 
 def _parse_tool_execution(

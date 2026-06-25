@@ -92,6 +92,13 @@
 - checkpointから未完了stepを判定できる
 - 差し戻し時に完了済みstepとやり直し対象stepを区別できる
 
+実装状況:
+
+- `TicketConversationGraph` が `select_next_step` / `execute_step` / `finalize_execution` でstepを1件ずつ実行する
+- `TaskOrchestrator.execute_single_step()` をLangGraphノードから呼び、`execute_plan()` への丸投げ経路を通常実行から外している
+- `plan_steps` と `step_results` にstepごとの実行結果を保存する
+- `TaskPlan.steps` が空の旧形式計画は、互換のため実行可能な単一stepへ補完する
+
 ## Phase 4: step単位の進捗反映を整える
 
 目的:
