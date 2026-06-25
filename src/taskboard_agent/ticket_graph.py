@@ -47,6 +47,11 @@ class TicketState(TypedDict, total=False):
     last_ingested_journal_id: int
     has_human_feedback: bool
     current_plan: dict[str, Any] | None
+    plan_steps: list[dict[str, Any]]
+    current_step_index: int | None
+    step_results: list[dict[str, Any]]
+    run_status: str
+    step_context: dict[str, Any]
     completed_steps: list[str]
     artifacts: list[dict[str, Any]]
     feedback_analysis: dict[str, Any] | None
@@ -179,6 +184,11 @@ class TicketConversationGraph:
             "dry_run": bool(state.get("dry_run", False)),
             "messages": messages,
             "last_ingested_journal_id": _max_journal_id(issue),
+            "plan_steps": [],
+            "current_step_index": None,
+            "step_results": [],
+            "run_status": "initialized",
+            "step_context": {},
             "completed_steps": [],
             "artifacts": [],
             "feedback_analysis": None,
@@ -187,7 +197,7 @@ class TicketConversationGraph:
 
     def _initial_plan(self, state: TicketState) -> dict[str, Any]:
         plan = self._task_orchestrator.create_plan(state["issue"])
-        return {"current_plan": _task_plan_dict(plan)}
+        return {"current_plan": _task_plan_dict(plan)} | _planned_step_state(plan)
 
     def _execute_initial(self, state: TicketState) -> dict[str, Any]:
         plan = _task_plan_from_dict(state["current_plan"])
@@ -287,7 +297,7 @@ class TicketConversationGraph:
                 return {
                     "feedback_analysis": normalized_revision,
                     "current_plan": _task_plan_dict(plan),
-                }
+                } | _planned_step_state(plan)
             except (TaskPlanningError, ValueError, TypeError, KeyError) as exc:
                 last_error = exc
         raise TaskPlanningError(
@@ -356,7 +366,7 @@ class TicketConversationGraph:
             "last_result": _execution_result_dict(result),
             "artifacts": artifacts,
             "waiting_reason": result.status,
-        }
+        } | _collapsed_execution_step_state(state, result.status)
 
     def _request_feedback(self, state: TicketState) -> dict[str, Any]:
         notes = "差し戻し後の修正指示を確認できませんでした。修正内容をコメントしてください。"
@@ -367,6 +377,7 @@ class TicketConversationGraph:
             "messages": [AIMessage(content=notes)],
             "last_result": _execution_result_dict(result),
             "waiting_reason": "needs_user",
+            "run_status": "needs_user",
         }
 
     def _emit(self, event: SkillEvent) -> None:
@@ -569,6 +580,68 @@ def _task_plan_dict(plan: TaskPlan) -> dict[str, Any]:
     data["steps"] = [asdict(step) for step in plan.steps]
     data["limitations"] = list(plan.limitations)
     return data
+
+
+def _planned_step_state(plan: TaskPlan) -> dict[str, Any]:
+    plan_steps = [
+        _plan_step_state(index=index, step=step)
+        for index, step in enumerate(plan.steps)
+    ]
+    return {
+        "plan_steps": plan_steps,
+        "current_step_index": 0 if plan_steps else None,
+        "step_results": [],
+        "run_status": "planned",
+        "step_context": {
+            "decision": plan.decision,
+            "reason": plan.reason,
+            "limitations": list(plan.limitations),
+            "execution_model": "execute_plan",
+        },
+    }
+
+
+def _plan_step_state(*, index: int, step: Any) -> dict[str, Any]:
+    return {
+        "id": f"step-{index + 1}",
+        "index": index,
+        "kind": step.kind,
+        "name": step.name,
+        "purpose": step.purpose,
+        "arguments": step.arguments,
+        "status": "pending",
+        "result": None,
+        "error": None,
+        "artifacts": [],
+    }
+
+
+def _collapsed_execution_step_state(
+    state: TicketState,
+    result_status: str,
+) -> dict[str, Any]:
+    plan_steps = list(state.get("plan_steps", []))
+    if result_status in ("processed", "already_done", "dry_run"):
+        plan_steps = [_completed_collapsed_step(step) for step in plan_steps]
+        current_step_index = None
+    else:
+        current_step_index = state.get("current_step_index")
+    step_context = dict(state.get("step_context", {}))
+    step_context["last_result_status"] = result_status
+    return {
+        "plan_steps": plan_steps,
+        "current_step_index": current_step_index,
+        "run_status": result_status,
+        "step_context": step_context,
+    }
+
+
+def _completed_collapsed_step(step: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(step)
+    updated["status"] = (
+        "skipped" if updated.get("kind") == "unavailable" else "completed"
+    )
+    return updated
 
 
 def _task_plan_from_dict(data: dict[str, Any] | None) -> TaskPlan:

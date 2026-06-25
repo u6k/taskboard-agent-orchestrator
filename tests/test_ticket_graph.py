@@ -27,17 +27,22 @@ class FakeOrchestrator:
     def __init__(
         self,
         *,
+        plan: TaskPlan | None = None,
         fail_revision_once: bool = False,
         artifacts: tuple[dict[str, Any], ...] = (),
         tools: list[dict[str, Any]] | None = None,
     ) -> None:
+        self.plan = plan or TaskPlan(
+            decision="no_skill",
+            reason="チケット本文だけで対応可能",
+        )
         self.executions: list[dict[str, Any]] = []
         self.fail_revision_once = fail_revision_once
         self.artifacts = artifacts
         self.tools = tools or []
 
     def create_plan(self, issue: dict[str, Any]) -> TaskPlan:
-        return TaskPlan(decision="no_skill", reason="チケット本文だけで対応可能")
+        return self.plan
 
     def planning_catalog(self) -> tuple[list[Any], list[dict[str, Any]]]:
         return [], self.tools
@@ -122,6 +127,72 @@ def test_initial_run_creates_ticket_conversation_and_interrupts() -> None:
     assert isinstance(state["messages"][0], HumanMessage)
     assert "案内文を作成してください" in state["messages"][0].content
     assert isinstance(state["messages"][-1], AIMessage)
+
+
+def test_initial_plan_steps_are_saved_in_graph_state() -> None:
+    graph = TicketConversationGraph(
+        task_orchestrator=FakeOrchestrator(  # type: ignore[arg-type]
+            plan=TaskPlan(
+                decision="no_skill",
+                reason="本文を整理して回答できる",
+                steps=(
+                    TaskStep(
+                        kind="llm",
+                        purpose="依頼内容を整理する",
+                        arguments={"format": "bullets"},
+                    ),
+                    TaskStep(
+                        kind="unavailable",
+                        purpose="外部承認が必要な作業は実行しない",
+                    ),
+                ),
+                limitations=("外部承認は未取得",),
+            )
+        ),
+        llm=FakeLLM([]),
+        checkpointer=InMemorySaver(),
+        ai_user_id=42,
+    )
+
+    graph.run(issue=_issue())
+
+    state = graph.conversation_state(123)
+    assert state["run_status"] == "processed"
+    assert state["current_step_index"] is None
+    assert state["step_results"] == []
+    assert state["step_context"] == {
+        "decision": "no_skill",
+        "reason": "本文を整理して回答できる",
+        "limitations": ["外部承認は未取得"],
+        "execution_model": "execute_plan",
+        "last_result_status": "processed",
+    }
+    assert state["plan_steps"] == [
+        {
+            "id": "step-1",
+            "index": 0,
+            "kind": "llm",
+            "name": None,
+            "purpose": "依頼内容を整理する",
+            "arguments": {"format": "bullets"},
+            "status": "completed",
+            "result": None,
+            "error": None,
+            "artifacts": [],
+        },
+        {
+            "id": "step-2",
+            "index": 1,
+            "kind": "unavailable",
+            "name": None,
+            "purpose": "外部承認が必要な作業は実行しない",
+            "arguments": None,
+            "status": "skipped",
+            "result": None,
+            "error": None,
+            "artifacts": [],
+        },
+    ]
 
 
 def test_resume_adds_only_new_human_comment_and_publishes_revision_first() -> None:
@@ -342,6 +413,13 @@ def test_revision_plan_preserves_step_based_work() -> None:
     assert plan.limitations == ("社内規程への適合は未確認",)
     assert "tool: OpenClawを検索する" in (events[0].notes or "")
     assert "Webページの情報収集 (web_search_pages)" not in (events[0].notes or "")
+    state = graph.conversation_state(123)
+    assert [step["kind"] for step in state["plan_steps"]] == ["tool", "llm"]
+    assert [step["name"] for step in state["plan_steps"]] == ["web_search_pages", None]
+    assert [step["status"] for step in state["plan_steps"]] == [
+        "completed",
+        "completed",
+    ]
 
 
 def test_search_artifact_is_saved_to_conversation_context() -> None:
