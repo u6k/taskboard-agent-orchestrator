@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Annotated, Any, Protocol, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
@@ -16,6 +16,7 @@ from taskboard_agent.task_executor import (
     TaskOrchestrator,
     TaskPlan,
     TaskPlanningError,
+    TaskStep,
     normalize_task_plan_names,
     parse_task_plan,
 )
@@ -87,24 +88,36 @@ class TicketConversationGraph:
         builder = StateGraph(TicketState)
         builder.add_node("initialize", self._initialize)
         builder.add_node("initial_plan", self._initial_plan)
-        builder.add_node("execute_initial", self._execute_initial)
+        builder.add_node("publish_initial_plan", self._publish_initial_plan)
+        builder.add_node("select_next_step", self._select_next_step)
+        builder.add_node("execute_step", self._execute_step)
+        builder.add_node("finalize_execution", self._finalize_execution)
         builder.add_node("wait_for_human", self._wait_for_human)
         builder.add_node("analyze_feedback", self._analyze_feedback)
         builder.add_node("publish_revision_plan", self._publish_revision_plan)
-        builder.add_node("execute_revision", self._execute_revision)
         builder.add_node("request_feedback", self._request_feedback)
         builder.add_edge(START, "initialize")
         builder.add_edge("initialize", "initial_plan")
-        builder.add_edge("initial_plan", "execute_initial")
-        builder.add_edge("execute_initial", "wait_for_human")
+        builder.add_edge("initial_plan", "publish_initial_plan")
+        builder.add_edge("publish_initial_plan", "select_next_step")
+        builder.add_conditional_edges(
+            "select_next_step",
+            self._route_selected_step,
+            {True: "execute_step", False: "finalize_execution"},
+        )
+        builder.add_conditional_edges(
+            "execute_step",
+            self._route_after_step,
+            {True: "select_next_step", False: "finalize_execution"},
+        )
+        builder.add_edge("finalize_execution", "wait_for_human")
         builder.add_conditional_edges(
             "wait_for_human",
             self._route_feedback,
             {True: "analyze_feedback", False: "request_feedback"},
         )
         builder.add_edge("analyze_feedback", "publish_revision_plan")
-        builder.add_edge("publish_revision_plan", "execute_revision")
-        builder.add_edge("execute_revision", "wait_for_human")
+        builder.add_edge("publish_revision_plan", "select_next_step")
         builder.add_edge("request_feedback", "wait_for_human")
         self._graph = builder.compile(checkpointer=checkpointer)
 
@@ -132,7 +145,7 @@ class TicketConversationGraph:
                     config=config,
                 )
             elif snapshot.values and snapshot.next:
-                if "execute_revision" in snapshot.next:
+                if _is_revision_step_resume(snapshot.values, snapshot.next):
                     analysis = snapshot.values.get("feedback_analysis")
                     if isinstance(analysis, dict):
                         self._emit(
@@ -196,12 +209,14 @@ class TicketConversationGraph:
         }
 
     def _initial_plan(self, state: TicketState) -> dict[str, Any]:
-        plan = self._task_orchestrator.create_plan(state["issue"])
+        plan = _ensure_executable_steps(self._task_orchestrator.create_plan(state["issue"]))
         return {"current_plan": _task_plan_dict(plan)} | _planned_step_state(plan)
 
-    def _execute_initial(self, state: TicketState) -> dict[str, Any]:
+    def _publish_initial_plan(self, state: TicketState) -> dict[str, Any]:
         plan = _task_plan_from_dict(state["current_plan"])
-        return self._execute(state, plan=plan, announce_plan=True)
+        notes = f"{self._task_orchestrator.plan_notes(plan)}\n\n作業を開始します。"
+        self._emit(SkillEvent("start", notes))
+        return {"messages": [AIMessage(content=notes)]}
 
     def _wait_for_human(self, state: TicketState) -> dict[str, Any]:
         payload = interrupt(
@@ -292,6 +307,7 @@ class TicketConversationGraph:
                     )
                 )
                 plan = normalize_task_plan_names(plan, skills=skills, tools=revision_tools)
+                plan = _ensure_executable_steps(plan)
                 normalized_revision = dict(revision)
                 normalized_revision["task_plan"] = _task_plan_dict(plan)
                 return {
@@ -312,61 +328,168 @@ class TicketConversationGraph:
         self._emit(SkillEvent("start", notes))
         return {"messages": [AIMessage(content=notes)]}
 
-    def _execute_revision(self, state: TicketState) -> dict[str, Any]:
+    def _select_next_step(self, state: TicketState) -> dict[str, Any]:
+        plan_steps = list(state.get("plan_steps", []))
+        for index, step in enumerate(plan_steps):
+            if step.get("status") in ("pending", "running"):
+                updated_step = dict(step)
+                updated_step["status"] = "running"
+                plan_steps[index] = updated_step
+                return {
+                    "plan_steps": plan_steps,
+                    "current_step_index": index,
+                    "run_status": "running",
+                }
+        return {"current_step_index": None}
+
+    @staticmethod
+    def _route_selected_step(state: TicketState) -> bool:
+        return state.get("current_step_index") is not None
+
+    def _execute_step(self, state: TicketState) -> dict[str, Any]:
         plan = _task_plan_from_dict(state["current_plan"])
-        return self._execute(state, plan=plan, announce_plan=False)
+        current_step_index = state.get("current_step_index")
+        if current_step_index is None:
+            raise TaskPlanningError("current step index is missing")
+        if current_step_index < 0 or current_step_index >= len(plan.steps):
+            raise TaskPlanningError("current step index is out of range")
 
-    def _execute(
-        self,
-        state: TicketState,
-        *,
-        plan: TaskPlan,
-        announce_plan: bool,
-    ) -> dict[str, Any]:
-        messages: list[AnyMessage] = []
+        issue = dict(state["issue"])
+        conversation_messages = _execution_conversation_messages(state)
+        if conversation_messages:
+            issue["conversation_context"] = conversation_messages
 
-        def record(event: SkillEvent) -> None:
-            if event.notes:
-                messages.append(AIMessage(content=event.notes))
-            self._emit(event)
-
-        result = self._task_orchestrator.execute_plan(
-            issue=state["issue"],
-            plan=plan,
-            dry_run=bool(state.get("dry_run", False)),
-            emit_event=record,
-            announce_plan=announce_plan,
-            conversation_messages=(
-                _message_dicts(state.get("messages", []))
-                if not announce_plan
-                else None
-            ),
-        )
-        completed = result.status in ("processed", "already_done", "dry_run")
-        for event in result.events:
-            if completed and event.kind in ("final_review", "final_return"):
-                if event.notes and event.notes != "作業が終了しました。":
-                    record(SkillEvent("progress", event.notes))
-                continue
-            record(event)
-        if completed:
-            record(SkillEvent("final_review", "作業が終了しました。"))
-        result_artifacts = _result_artifacts(result)
-        if result_artifacts:
-            messages.extend(
-                AIMessage(
-                    content=f"今回の作業成果JSON:\n{json.dumps(artifact, ensure_ascii=False)}"
-                )
-                for artifact in result_artifacts
+        step_context = dict(state.get("step_context", {}))
+        context_messages = step_context.get("messages")
+        if not isinstance(context_messages, list):
+            context_messages = self._task_orchestrator.step_context_messages(
+                issue=issue,
+                conversation_messages=conversation_messages,
             )
+
+        execution = self._task_orchestrator.execute_single_step(
+            issue=issue,
+            plan=plan,
+            step=plan.steps[current_step_index],
+            step_index=current_step_index + 1,
+            dry_run=bool(state.get("dry_run", False)),
+            step_context=context_messages,
+        )
+
+        result_artifacts = _result_artifacts(execution.result)
+        updated_context_messages = [*context_messages, *execution.context_messages]
+        step_context["messages"] = updated_context_messages
+        step_context["last_step_status"] = execution.result.status
+        if execution.terminal_status:
+            step_context["terminal_status"] = execution.terminal_status
+
+        messages: list[AnyMessage] = []
+        for event in execution.events:
+            recorded = _step_event_for_redmine(
+                event,
+                terminal=execution.should_stop,
+            )
+            if recorded.notes:
+                messages.append(AIMessage(content=recorded.notes))
+            self._emit(recorded)
+        messages.extend(
+            AIMessage(content=message["content"])
+            for message in execution.context_messages
+            if isinstance(message.get("content"), str)
+        )
         artifacts = list(state.get("artifacts", []))
         artifacts.extend(result_artifacts)
+
+        plan_steps = _record_executed_step(
+            state.get("plan_steps", []),
+            index=current_step_index,
+            result=execution.result,
+            artifacts=result_artifacts,
+        )
+        step_results = list(state.get("step_results", []))
+        step_results.append(
+            {
+                "step_id": plan_steps[current_step_index].get("id"),
+                "index": current_step_index,
+                "status": execution.result.status,
+                "result": _execution_result_dict(execution.result),
+                "events": [_skill_event_dict(event) for event in execution.events],
+                "artifacts": result_artifacts,
+            }
+        )
+        return {
+            "messages": messages,
+            "artifacts": artifacts,
+            "plan_steps": plan_steps,
+            "current_step_index": (
+                current_step_index if execution.should_stop else None
+            ),
+            "step_results": step_results,
+            "run_status": execution.result.status,
+            "step_context": step_context,
+        }
+
+    @staticmethod
+    def _route_after_step(state: TicketState) -> bool:
+        if _current_step_is_terminal(state):
+            return False
+        return _next_pending_step_index(state.get("plan_steps", [])) is not None
+
+    def _finalize_execution(self, state: TicketState) -> dict[str, Any]:
+        plan = _task_plan_from_dict(state["current_plan"])
+        if not state.get("plan_steps") and plan.decision == "needs_user":
+            result = SkillExecutionResult(
+                status="needs_user",
+                events=(SkillEvent("final_review", plan.user_request or plan.reason),),
+                dry_run=bool(state.get("dry_run", False)),
+            )
+            event = result.events[0]
+            self._emit(event)
+            return {
+                "messages": [AIMessage(content=event.notes or "")],
+                "last_result": _execution_result_dict(result),
+                "waiting_reason": result.status,
+                "run_status": result.status,
+            }
+
+        status = _final_execution_status(
+            state,
+            dry_run=bool(state.get("dry_run", False)),
+        )
+        final_step_event = self._task_orchestrator.step_final_event(
+            plan=plan,
+            status=status,
+        )
+        messages: list[AnyMessage] = []
+        if status in ("processed", "already_done", "dry_run"):
+            progress_event = SkillEvent("progress", final_step_event.notes)
+            self._emit(progress_event)
+            if progress_event.notes:
+                messages.append(AIMessage(content=progress_event.notes))
+            review_event = SkillEvent("final_review", "作業が終了しました。")
+            self._emit(review_event)
+            messages.append(AIMessage(content=review_event.notes))
+        else:
+            self._emit(final_step_event)
+            if final_step_event.notes:
+                messages.append(AIMessage(content=final_step_event.notes))
+
+        result = SkillExecutionResult(
+            status=status,
+            events=(),
+            artifacts=tuple(state.get("artifacts", [])),
+            dry_run=bool(state.get("dry_run", False)),
+        )
+        step_context = dict(state.get("step_context", {}))
+        step_context["last_result_status"] = status
         return {
             "messages": messages,
             "last_result": _execution_result_dict(result),
-            "artifacts": artifacts,
-            "waiting_reason": result.status,
-        } | _collapsed_execution_step_state(state, result.status)
+            "current_step_index": None if status in ("processed", "already_done", "dry_run") else state.get("current_step_index"),
+            "run_status": status,
+            "step_context": step_context,
+            "waiting_reason": status,
+        }
 
     def _request_feedback(self, state: TicketState) -> dict[str, Any]:
         notes = "差し戻し後の修正指示を確認できませんでした。修正内容をコメントしてください。"
@@ -596,9 +719,65 @@ def _planned_step_state(plan: TaskPlan) -> dict[str, Any]:
             "decision": plan.decision,
             "reason": plan.reason,
             "limitations": list(plan.limitations),
-            "execution_model": "execute_plan",
+            "execution_model": "langgraph_step_loop",
         },
     }
+
+
+def _ensure_executable_steps(plan: TaskPlan) -> TaskPlan:
+    if plan.steps or plan.decision == "needs_user":
+        return plan
+    if plan.decision == "no_skill":
+        instruction = None
+        if isinstance(plan.task_input, dict):
+            value = plan.task_input.get("instruction")
+            instruction = value if isinstance(value, str) and value.strip() else None
+        return replace(
+            plan,
+            steps=(
+                TaskStep(
+                    kind="llm",
+                    purpose=instruction or plan.reason,
+                    arguments=plan.task_input,
+                ),
+            ),
+        )
+    if plan.decision == "use_skill":
+        if not plan.skill_name:
+            return replace(
+                plan,
+                decision="needs_user",
+                user_request="利用するスキルを特定できませんでした。作業内容を具体的に追記してください。",
+            )
+        return replace(
+            plan,
+            steps=(
+                TaskStep(
+                    kind="skill",
+                    name=plan.skill_name,
+                    purpose=plan.reason,
+                    arguments=plan.task_input,
+                ),
+            ),
+        )
+    if not plan.tool_names:
+        return replace(
+            plan,
+            decision="needs_user",
+            user_request="利用するtoolを特定できませんでした。作業内容を具体的に追記してください。",
+        )
+    return replace(
+        plan,
+        steps=tuple(
+            TaskStep(
+                kind="tool",
+                name=tool_name,
+                purpose=plan.reason,
+                arguments=plan.task_input,
+            )
+            for tool_name in plan.tool_names
+        ),
+    )
 
 
 def _plan_step_state(*, index: int, step: Any) -> dict[str, Any]:
@@ -614,6 +793,99 @@ def _plan_step_state(*, index: int, step: Any) -> dict[str, Any]:
         "error": None,
         "artifacts": [],
     }
+
+
+def _record_executed_step(
+    plan_steps: list[dict[str, Any]],
+    *,
+    index: int,
+    result: SkillExecutionResult,
+    artifacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    updated_steps = [dict(step) for step in plan_steps]
+    if index < 0 or index >= len(updated_steps):
+        raise TaskPlanningError("executed step index is out of range")
+    step = updated_steps[index]
+    step["status"] = _step_status_from_result(result)
+    step["result"] = _execution_result_dict(result)
+    step["error"] = _event_notes(result.events) if step["status"] == "failed" else None
+    step["artifacts"] = artifacts
+    return updated_steps
+
+
+def _step_status_from_result(result: SkillExecutionResult) -> str:
+    if result.status == "skipped":
+        return "skipped"
+    if result.status in ("processed", "already_done", "dry_run"):
+        return "completed"
+    if result.status in ("needs_user", "missing_tool"):
+        return "needs_user"
+    return "failed"
+
+
+def _skill_event_dict(event: SkillEvent) -> dict[str, Any]:
+    return {"kind": event.kind, "notes": event.notes}
+
+
+def _event_notes(events: tuple[SkillEvent, ...]) -> str:
+    notes = [event.notes for event in events if event.notes]
+    return "\n\n".join(notes) if notes else ""
+
+
+def _step_event_for_redmine(event: SkillEvent, *, terminal: bool) -> SkillEvent:
+    if not terminal and event.kind in ("final_review", "final_return"):
+        return SkillEvent("progress", event.notes)
+    return event
+
+
+def _next_pending_step_index(plan_steps: list[dict[str, Any]]) -> int | None:
+    for index, step in enumerate(plan_steps):
+        if step.get("status") in ("pending", "running"):
+            return index
+    return None
+
+
+def _current_step_is_terminal(state: TicketState) -> bool:
+    current_step_index = state.get("current_step_index")
+    if current_step_index is None:
+        return False
+    plan_steps = state.get("plan_steps", [])
+    if current_step_index < 0 or current_step_index >= len(plan_steps):
+        return True
+    return plan_steps[current_step_index].get("status") in (
+        "failed",
+        "needs_user",
+    )
+
+
+def _final_execution_status(state: TicketState, *, dry_run: bool) -> str:
+    for step in state.get("plan_steps", []):
+        if step.get("status") == "failed":
+            return "failed"
+        if step.get("status") == "needs_user":
+            result = step.get("result")
+            if isinstance(result, dict) and result.get("status") == "missing_tool":
+                return "missing_tool"
+            return "needs_user"
+    return "dry_run" if dry_run else "processed"
+
+
+def _execution_conversation_messages(state: TicketState) -> list[dict[str, Any]] | None:
+    if not isinstance(state.get("feedback_analysis"), dict):
+        return None
+    return _message_dicts(state.get("messages", []))
+
+
+def _is_revision_step_resume(
+    values: dict[str, Any],
+    next_nodes: tuple[str, ...],
+) -> bool:
+    if not isinstance(values.get("feedback_analysis"), dict):
+        return False
+    return any(
+        node in {"select_next_step", "execute_step", "finalize_execution"}
+        for node in next_nodes
+    )
 
 
 def _collapsed_execution_step_state(

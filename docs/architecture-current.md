@@ -13,7 +13,8 @@ CLI
     -> TicketConversationGraph.run(issue)
       -> LangGraph checkpointでチケット会話を保存・再開
       -> TaskOrchestrator.create_plan()
-      -> TaskOrchestrator.execute_plan()
+      -> LangGraphノードでstepを1件ずつ選択・実行
+      -> TaskOrchestrator.execute_single_step()
     -> SkillEventをRedmine更新へ反映
 ```
 
@@ -49,9 +50,11 @@ LangGraphによるチケット単位の会話状態管理を担当する。
 - 初回実行時にチケット本文と既存コメントをLangChain messageへ変換する
 - 初回計画、初回実行、待機、差し戻し解析、再計画、再実行を状態遷移として扱う
 - 人間の追加コメントだけを取り込み、保存済み会話へ追加する
-- 実行結果のartifactをstateに保存する
+- `select_next_step` / `execute_step` / `finalize_execution` でstepを1件ずつ実行する
+- 各stepの `status`, `result`, `error`, `artifacts` をstateに保存する
+- 実行結果のartifactを会話コンテキストとstateに保存する
 
-現在のLangGraphは、主に会話履歴と再開状態の保持に使われている。作業stepそのものは、LangGraphノードとして1件ずつ実行されていない。
+現在のLangGraphは、会話履歴、再開状態、step単位の実行状態を保持する。stepは配列から削除せず、`pending`, `running`, `completed`, `failed`, `needs_user`, `skipped` のstatusで管理する。
 
 ### `TaskOrchestrator`
 
@@ -59,10 +62,11 @@ LangGraphによるチケット単位の会話状態管理を担当する。
 
 - `LiteLLMTaskPlanner` でチケット、利用可能スキル、利用可能toolから `TaskPlan` を作る
 - `decision` に応じて `use_skill`, `use_tools`, `no_skill`, `needs_user` を分岐する
-- `steps` がある場合は `_execute_steps()` でPythonのforループとして順番に実行する
+- `execute_single_step()` でLangGraphから1stepだけ実行できる部品を提供する
+- `execute_plan()` と `_execute_steps()` は互換経路として残り、内部では `execute_single_step()` を呼ぶ
 - LLM step、tool step、skill step、unavailable stepを処理する
 
-現在の大きな構造的特徴は、`TaskOrchestrator._execute_steps()` がstep列をまとめて実行している点である。LangGraphから見ると、step実行の途中経過は1つのノード内部の処理になっている。
+現在の大きな構造的特徴は、通常のチケット実行では `TicketConversationGraph` がstep実行ループを持ち、`TaskOrchestrator` は1step実行の実作業を担当する点である。これにより、stepごとのcheckpointから未完了stepや停止stepを判定できる。
 
 ### LangChain Tool / `LangChainAgentRunner`
 
@@ -76,10 +80,9 @@ LangGraphによるチケット単位の会話状態管理を担当する。
 
 ## 現在の制約
 
-- stepごとの状態はLangGraph stateとして十分に表現されていない
-- step完了ごとのcheckpointではなく、まとまった実行結果として保存されやすい
-- `completed_steps` は存在するが、step実行管理の中心にはなっていない
-- step列そのものの実行ループはまだLangGraphノード遷移へ移っていない
+- step単位のRedmine進捗コメントは、まだ既存の `progress` / `final_review` / `final_return` に寄せている
+- `completed_steps` は互換用に残っているが、step実行管理の中心は `plan_steps` と `step_results` である
+- `TaskOrchestrator.execute_plan()` の互換経路は残っているため、完全な移行後に整理余地がある
 - Redmine更新責務は `workflow.py` にあり、LangGraphノードから直接Redmine APIを更新しない
 
 ## 維持する前提

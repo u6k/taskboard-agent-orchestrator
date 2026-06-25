@@ -24,8 +24,8 @@ def revision_plan_response_format(
         {
             "type": "object",
             "properties": {
-                "previous_work_summary": {"type": "string"},
-                "feedback_summary": {"type": "string"},
+                "previous_work_summary": _non_empty_string_schema(),
+                "feedback_summary": _non_empty_string_schema(),
                 "requested_changes": _string_array_schema(),
                 "keep_existing_results": _string_array_schema(),
                 "work_to_redo": _string_array_schema(),
@@ -57,7 +57,7 @@ def generic_execution_response_format() -> dict[str, Any]:
                     "type": "string",
                     "enum": ["completed", "needs_user", "missing_tool"],
                 },
-                "notes": {"type": "string"},
+                "notes": _non_empty_string_schema(),
             },
             "required": ["status", "notes"],
             "additionalProperties": False,
@@ -97,7 +97,7 @@ def _execution_response_format(
             "type": "object",
             "properties": {
                 "status": {"type": "string", "enum": list(statuses)},
-                "notes": {"type": "string"},
+                "notes": _non_empty_string_schema(),
                 "target_url": nullable_string,
                 "page_title": nullable_string,
                 "briefing": nullable_string,
@@ -131,7 +131,7 @@ def _task_plan_schema(
                 "type": "string",
                 "enum": ["use_skill", "use_tools", "no_skill", "needs_user"],
             },
-            "reason": {"type": "string"},
+            "reason": _non_empty_string_schema(),
             "skill_name": _nullable_enum_schema(skills),
             "tool_names": {
                 "type": "array",
@@ -163,7 +163,7 @@ def _task_plan_schema(
                             "enum": ["skill", "tool", "llm", "unavailable"],
                         },
                         "name": _nullable_enum_schema(step_names),
-                        "purpose": {"type": "string"},
+                        "purpose": _non_empty_string_schema(),
                         "arguments": {
                             "anyOf": [
                                 {"type": "object"},
@@ -205,6 +205,10 @@ def _response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
 
 def _string_array_schema() -> dict[str, Any]:
     return {"type": "array", "items": {"type": "string"}}
+
+
+def _non_empty_string_schema() -> dict[str, Any]:
+    return {"type": "string", "minLength": 1}
 
 
 def _nullable_enum_schema(values: list[str]) -> dict[str, Any]:
