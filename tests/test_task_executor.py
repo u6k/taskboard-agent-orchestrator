@@ -758,6 +758,127 @@ def test_orchestrator_recovers_tool_step_after_schema_failure() -> None:
     assert len(tool_catalog.calls) == 1
 
 
+def test_orchestrator_executes_single_tool_step() -> None:
+    tool_catalog = StepToolCatalog()
+    plan = TaskPlan(
+        decision="use_tools",
+        reason="検索する",
+        tool_names=("web_search_pages",),
+    )
+    step = TaskStep(
+        kind="tool",
+        name="web_search_pages",
+        purpose="OpenClawを検索する",
+        arguments={"query": "openclaw"},
+    )
+
+    execution = TaskOrchestrator(
+        planner=StubPlanner(plan),
+        skill_registry=FakeSkillRegistry([_skill()]),  # type: ignore[arg-type]
+        tool_catalog=tool_catalog,  # type: ignore[arg-type]
+        skill_agent=FakeSkillAgent(),
+        generic_runner=GenericTaskRunner(FakeLLM([])),
+    ).execute_single_step(
+        issue=_issue(),
+        plan=plan,
+        step=step,
+        step_index=1,
+    )
+
+    assert execution.index == 1
+    assert execution.step == step
+    assert execution.result.status == "processed"
+    assert execution.should_stop is False
+    assert execution.events[0] == SkillEvent("progress", "ステップ 1 を実行しました: OpenClawを検索する")
+    assert execution.artifacts[0]["type"] == "web_search_pages"
+    assert "ステップ 1 実行結果" in execution.context_messages[0]["content"]
+    assert "ステップ 1 成果JSON" in execution.context_messages[1]["content"]
+
+
+def test_orchestrator_executes_single_skill_step() -> None:
+    plan = TaskPlan(decision="use_skill", reason="スキルで処理する")
+    step = TaskStep(
+        kind="skill",
+        name="web-briefing-bookmark",
+        purpose="Webページを要約して登録する",
+        arguments={"target_url": "https://example.test/article"},
+    )
+
+    execution = TaskOrchestrator(
+        planner=StubPlanner(plan),
+        skill_registry=FakeSkillRegistry([_skill()]),  # type: ignore[arg-type]
+        tool_catalog=FakeToolCatalog(),
+        skill_agent=FakeSkillAgent(),
+        generic_runner=GenericTaskRunner(FakeLLM([])),
+    ).execute_single_step(
+        issue=_issue(),
+        plan=plan,
+        step=step,
+        step_index=1,
+    )
+
+    assert execution.result.status == "processed"
+    assert execution.should_stop is False
+    assert execution.events[0].notes == "ステップ 1 を実行しました: Webページを要約して登録する"
+    assert any("done" in (event.notes or "") for event in execution.events)
+
+
+def test_orchestrator_executes_single_llm_step_with_context() -> None:
+    generic = GenericTaskRunner(FakeLLM(["単体LLMステップを実行しました。"]))
+    plan = TaskPlan(
+        decision="no_skill",
+        reason="LLMで整理する",
+        limitations=("外部確認は未実施",),
+    )
+    step = TaskStep(kind="llm", purpose="チケット本文を整理する")
+
+    execution = TaskOrchestrator(
+        planner=StubPlanner(plan),
+        skill_registry=FakeSkillRegistry([_skill()]),  # type: ignore[arg-type]
+        tool_catalog=FakeToolCatalog(),
+        skill_agent=FakeSkillAgent(),
+        generic_runner=generic,
+    ).execute_single_step(
+        issue=_issue(),
+        plan=plan,
+        step=step,
+        step_index=2,
+        step_context=[{"role": "assistant", "content": "前のステップ結果"}],
+    )
+
+    assert execution.result.status == "processed"
+    assert execution.events[0].notes == "ステップ 2 を実行しました: チケット本文を整理する"
+    assert any("単体LLMステップを実行しました。" in (event.notes or "") for event in execution.events)
+    assert "前のステップ結果" in str(generic._llm.messages[0])
+    assert "ステップ目的: チケット本文を整理する" in str(generic._llm.messages[0])
+
+
+def test_orchestrator_executes_single_unavailable_step_as_skipped() -> None:
+    plan = TaskPlan(decision="needs_user", reason="実行できない工程がある")
+    step = TaskStep(kind="unavailable", purpose="社内システムの権限変更は実行できない")
+
+    execution = TaskOrchestrator(
+        planner=StubPlanner(plan),
+        skill_registry=FakeSkillRegistry([_skill()]),  # type: ignore[arg-type]
+        tool_catalog=FakeToolCatalog(),
+        skill_agent=FakeSkillAgent(),
+        generic_runner=GenericTaskRunner(FakeLLM([])),
+    ).execute_single_step(
+        issue=_issue(),
+        plan=plan,
+        step=step,
+        step_index=3,
+    )
+
+    assert execution.result.status == "skipped"
+    assert execution.should_stop is False
+    assert execution.events == (
+        SkillEvent("progress", "未実行の作業 3: 社内システムの権限変更は実行できない"),
+    )
+    assert execution.artifacts == ()
+    assert execution.context_messages == ()
+
+
 def test_orchestrator_falls_back_when_web_search_final_json_is_empty() -> None:
     tool_catalog = FakeToolCatalog()
     skill_agent = SearchArtifactSkillAgent(final_text="")
