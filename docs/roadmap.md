@@ -118,6 +118,13 @@
 - LangGraph stateから機械的にstep状態が追える
 - 途中失敗時の再開判断が明確になる
 
+実装状況:
+
+- `TicketConversationGraph` がstep選択時に `progress` としてstep開始コメントを出す
+- step実行後に `processed` / `dry_run` / `already_done` は完了、`skipped` はスキップ、`needs_user` / `missing_tool` は判断待ち、その他は失敗として `progress` コメントを出す
+- `plan_steps` と `step_results` にstepごとの状態、結果、artifactを保存する
+- `final_review` / `final_return` によるレビュー戻しのRedmine更新仕様は維持する
+
 ## Phase 5: tool管理とfunction calling loopを標準化する
 
 目的:

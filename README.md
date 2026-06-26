@@ -121,6 +121,7 @@ uv run taskboard-agent run-once --dry-run
 - [docs/use-cases.md](docs/use-cases.md): 実装対象ユースケースと成長順
 - [docs/architecture-current.md](docs/architecture-current.md): 現在の実装構造
 - [docs/architecture-target.md](docs/architecture-target.md): 目指すアーキテクチャ
+- [docs/langgraph-ticket-graph.md](docs/langgraph-ticket-graph.md): `TicketConversationGraph` のLangGraphノード、エッジ、state
 - [docs/tools-and-skills.md](docs/tools-and-skills.md): 現在利用できるtoolとskill
 - [docs/roadmap.md](docs/roadmap.md): 段階的な改善計画
 - [docs/adr/README.md](docs/adr/README.md): アーキテクチャ判断記録

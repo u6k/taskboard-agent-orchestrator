@@ -45,6 +45,7 @@ Redmine操作はMCPではなく、Python実装からRedmine REST APIを呼び出
 ### `TicketConversationGraph`
 
 LangGraphによるチケット単位の会話状態管理を担当する。
+詳細なノード、エッジ、stateは [langgraph-ticket-graph.md](langgraph-ticket-graph.md) に記載する。
 
 - `redmine-issue-{issue_id}` をthread IDにする
 - 初回実行時にチケット本文と既存コメントをLangChain messageへ変換する
@@ -80,7 +81,7 @@ LangGraphによるチケット単位の会話状態管理を担当する。
 
 ## 現在の制約
 
-- step単位のRedmine進捗コメントは、まだ既存の `progress` / `final_review` / `final_return` に寄せている
+- step単位のRedmine進捗コメントは、既存の `progress` / `final_review` / `final_return` に寄せている。step開始、完了、スキップ、判断待ち、失敗は `progress` として記録する
 - `completed_steps` は互換用に残っているが、step実行管理の中心は `plan_steps` と `step_results` である
 - `TaskOrchestrator.execute_plan()` の互換経路は残っているため、完全な移行後に整理余地がある
 - Redmine更新責務は `workflow.py` にあり、LangGraphノードから直接Redmine APIを更新しない

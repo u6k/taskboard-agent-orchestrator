@@ -335,7 +335,10 @@ class TicketConversationGraph:
                 updated_step = dict(step)
                 updated_step["status"] = "running"
                 plan_steps[index] = updated_step
+                started_event = _step_started_event(updated_step)
+                self._emit(started_event)
                 return {
+                    "messages": [AIMessage(content=started_event.notes or "")],
                     "plan_steps": plan_steps,
                     "current_step_index": index,
                     "run_status": "running",
@@ -406,6 +409,13 @@ class TicketConversationGraph:
             result=execution.result,
             artifacts=result_artifacts,
         )
+        step_status_event = _step_status_event(
+            step=plan_steps[current_step_index],
+            status=execution.result.status,
+        )
+        if step_status_event.notes:
+            messages.append(AIMessage(content=step_status_event.notes))
+        self._emit(step_status_event)
         step_results = list(state.get("step_results", []))
         step_results.append(
             {
@@ -830,6 +840,36 @@ def _skill_event_dict(event: SkillEvent) -> dict[str, Any]:
 def _event_notes(events: tuple[SkillEvent, ...]) -> str:
     notes = [event.notes for event in events if event.notes]
     return "\n\n".join(notes) if notes else ""
+
+
+def _step_started_event(step: dict[str, Any]) -> SkillEvent:
+    return SkillEvent("progress", f"{_step_label(step)} を開始しました: {_step_purpose(step)}")
+
+
+def _step_status_event(*, step: dict[str, Any], status: str) -> SkillEvent:
+    label = _step_label(step)
+    purpose = _step_purpose(step)
+    if status in ("processed", "already_done", "dry_run"):
+        verb = "完了しました"
+    elif status == "skipped":
+        verb = "スキップしました"
+    elif status in ("needs_user", "missing_tool"):
+        verb = "判断待ちで停止しました"
+    else:
+        verb = "失敗しました"
+    return SkillEvent("progress", f"{label} を{verb}: {purpose}")
+
+
+def _step_label(step: dict[str, Any]) -> str:
+    index = step.get("index")
+    if isinstance(index, int):
+        return f"ステップ {index + 1}"
+    return "ステップ"
+
+
+def _step_purpose(step: dict[str, Any]) -> str:
+    purpose = step.get("purpose")
+    return purpose if isinstance(purpose, str) and purpose.strip() else "(目的未記載)"
 
 
 def _step_event_for_redmine(event: SkillEvent, *, terminal: bool) -> SkillEvent:
