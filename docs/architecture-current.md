@@ -4,11 +4,12 @@
 
 ## 全体像
 
-現在の実装は、Redmineをタスクボードとして使う one-shot CLI である。CLIが依存オブジェクトを組み立て、Redmineから対象チケットを取得し、LangGraphでチケット単位の会話状態を保持しながら、TaskOrchestratorが計画と実行分岐を担当する。
+現在の実装は、Redmineをタスクボードとして使うCLIである。`run-once` は1件だけ処理して終了し、`run-daemon` は単一プロセス内で担当チケットをpollして継続処理する。CLIが依存オブジェクトを組み立て、Redmineから対象チケットを取得し、LangGraphでチケット単位の会話状態を保持しながら、TaskOrchestratorが計画と実行分岐を担当する。
 
 ```text
 CLI
-  -> workflow.run_once()
+  -> run-once
+    -> workflow.run_once()
     -> Redmineから対象チケット取得
     -> TicketConversationGraph.run(issue)
       -> LangGraph checkpointでチケット会話を保存・再開
@@ -16,18 +17,34 @@ CLI
       -> LangGraphノードでstepを1件ずつ選択・実行
       -> TaskOrchestrator.execute_single_step()
     -> SkillEventをRedmine更新へ反映
+  -> run-daemon
+    -> daemon.run_daemon()
+      -> workflow.run_once() を繰り返し呼ぶ
+      -> 対象なしの場合だけpolling interval待機
 ```
 
 ## 主要コンポーネント
 
 ### `cli.py`
 
-`taskboard-agent run-once` のエントリポイントである。
+`taskboard-agent run-once` と `taskboard-agent run-daemon` のエントリポイントである。
 
 - `.env` と環境変数から設定を読む
 - `RedmineClient`, `LiteLLMClient`, `ChatLiteLLM`, `SkillRegistry`, `ToolScriptCatalog`, `TaskOrchestrator`, `TicketConversationGraph` を組み立てる
 - `--dry-run` では `InMemorySaver` を使う
 - 通常実行ではSQLite Checkpointerを使う
+- `run-once` では `workflow.run_once()` を1回呼び、結果を標準出力へ表示する
+- `run-daemon` では `daemon.run_daemon()` を呼び、1件処理後は待たずに次の検索を行う
+
+### `daemon.py`
+
+単一プロセスの常駐ループを担当する。
+
+- `workflow.run_once()` を1巡ごとに呼び、常にAI担当チケット検索から始める
+- `RunResult.status == "no_issue"` の場合だけ `interval_seconds` 秒待機する
+- `no_issue` 以外は成功、判断待ち、失敗戻しを問わず1件処理済みとして扱い、待機せず次の検索へ進む
+- `--max-iterations` は開発時やテスト時に指定できる
+- `--dry-run` のdaemon実行では、同じチケットの再処理を避けるため `--max-iterations` を必須にする
 
 ### `workflow.py`
 
