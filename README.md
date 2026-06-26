@@ -2,7 +2,7 @@
 
 秘書AIとタスクボードを仲介にして、AIエージェントが業務タスクを継続的に処理するための実行基盤です。
 
-初期実装では Redmine をタスクボードとして扱い、AIユーザーに割り当てられたチケットを1件取得して、依頼内容の理解、計画、スキルまたはtoolの実行、進捗コメント、レビュー戻しまでを one-shot CLI で処理します。
+初期実装では Redmine をタスクボードとして扱い、AIユーザーに割り当てられたチケットを取得して、依頼内容の理解、計画、スキルまたはtoolの実行、進捗コメント、レビュー戻しまでをCLIで処理します。手動実行向けの one-shot 実行と、常駐して担当チケットをpollするdaemon実行を提供します。
 
 ## 目的
 
@@ -17,7 +17,7 @@ flowchart TD
     Human["fa:fa-user 人間<br/>依頼・判断・承認・完了確認"]
     Secretary["fa:fa-comments 秘書AI<br/>依頼整理・状況説明・判断待ち提示"]
     Redmine["fa:fa-list-check Redmine<br/>タスクボード・コメント・担当・ステータス"]
-    CLI["fa:fa-terminal taskboard-agent CLI<br/>one-shot実行入口"]
+    CLI["fa:fa-terminal taskboard-agent CLI<br/>run-once / run-daemon"]
     Workflow["fa:fa-route Workflow<br/>チケット取得・Redmine更新反映"]
     Graph["fa:fa-diagram-project TicketConversationGraph<br/>LangGraph checkpoint・差し戻し再開"]
     Orchestrator["fa:fa-gears TaskOrchestrator<br/>計画作成・skill/tool/llm実行分岐"]
@@ -50,7 +50,7 @@ flowchart TD
 - 人間: 作業を依頼し、判断、承認、差し戻し、完了確認を行う。
 - 秘書AI: 人間の依頼をタスクとして整理し、状況や判断待ち事項を人間に説明する想定の窓口。
 - Redmine: 初期タスクボード。依頼内容、担当、ステータス、コメント、成果報告を保持する。
-- `taskboard-agent CLI`: Redmine上の処理対象チケットを1件処理する実行入口。
+- `taskboard-agent CLI`: Redmine上の処理対象チケットを1件処理する `run-once` と、担当チケットを継続的に検出する `run-daemon` の実行入口。
 - `Workflow`: Redmineチケット取得と、実行イベントをRedmineコメント・ステータス・担当者更新へ反映する層。
 - `TicketConversationGraph`: LangGraphでチケット単位の会話、計画、成果、差し戻し再開状態を保存する層。
 - `TaskOrchestrator`: チケット内容から実行計画を作り、skill、tool、LLMだけでの処理、ユーザー確認待ちへ分岐する層。
@@ -114,6 +114,24 @@ Redmineや外部サービスを更新せず、依頼理解、スキル選択、t
 
 ```powershell
 uv run taskboard-agent run-once --dry-run
+```
+
+AIユーザーに割り当てられたRedmineチケットを継続的に処理します。担当チケットが見つかった場合は1件処理後すぐ次の検索を行い、担当チケットがない場合だけ既定60秒待機します。
+
+```powershell
+uv run taskboard-agent run-daemon
+```
+
+ポーリング間隔を変更できます。
+
+```powershell
+uv run taskboard-agent run-daemon --interval-seconds 30
+```
+
+dry-runでdaemonを確認する場合は、同じチケットの再処理を避けるため実行巡数を指定します。
+
+```powershell
+uv run taskboard-agent run-daemon --dry-run --max-iterations 1
 ```
 
 ## ドキュメント

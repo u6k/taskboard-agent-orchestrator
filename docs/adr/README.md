@@ -87,3 +87,4 @@ Accepted
 - [ADR-0003: Keep README as the first-read entrypoint](0003-keep-readme-as-entrypoint.md)
 - [ADR-0004: Evolve LangGraph to step-level execution state](0004-evolve-langgraph-to-step-execution.md)
 - [ADR-0005: Use LangChain Tools and Agent Loop](0005-use-langchain-tools-and-agent-loop.md)
+- [ADR-0006: Add Single Process Polling Daemon](0006-add-single-process-polling-daemon.md)
