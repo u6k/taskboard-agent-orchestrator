@@ -166,7 +166,18 @@ def _task_plan_schema(
                         "purpose": _non_empty_string_schema(),
                         "arguments": {
                             "anyOf": [
-                                {"type": "object"},
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "key": _non_empty_string_schema(),
+                                            "value": {"type": "string"},
+                                        },
+                                        "required": ["key", "value"],
+                                        "additionalProperties": False,
+                                    },
+                                },
                                 {"type": "null"},
                             ]
                         },

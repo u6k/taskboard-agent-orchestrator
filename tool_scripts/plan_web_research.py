@@ -10,6 +10,12 @@ from taskboard_agent.tool_loader import ToolRuntimeContext
 
 
 MAX_INPUT_CHARS = 30000
+DEFAULT_PURPOSE = "未指定"
+DEFAULT_AUDIENCE = "SNS・ブログ上の不特定多数"
+DEFAULT_TARGET_PERIOD = "特に指定なし"
+DEFAULT_TARGET_REGION = "指定なし"
+DEFAULT_TARGET_DOMAIN = "指定なし"
+DEFAULT_EXCLUDED_SCOPE = "なし"
 
 SYSTEM_PROMPT = """あなたはWebリサーチの調査設計を行う専門リサーチャーです。
 Redmineチケットの内容を読み、テーマをそのまま検索語にせず、レポート作成に必要なリサーチクエスチョンと検索クエリを設計してください。
@@ -135,16 +141,14 @@ def _validate_plan(value: Any) -> dict[str, Any]:
     }
     if set(value) != required:
         raise ValueError("LLM response fields did not match the research plan schema")
-    for key in (
-        "topic",
-        "purpose",
-        "audience",
-        "target_period",
-        "target_region",
-        "target_domain",
-        "excluded_scope",
-        "main_question",
-    ):
+    _fill_default(value, "purpose", DEFAULT_PURPOSE)
+    _fill_default(value, "audience", DEFAULT_AUDIENCE)
+    _fill_default(value, "target_period", DEFAULT_TARGET_PERIOD)
+    _fill_default(value, "target_region", DEFAULT_TARGET_REGION)
+    _fill_default(value, "target_domain", DEFAULT_TARGET_DOMAIN)
+    _fill_default(value, "excluded_scope", DEFAULT_EXCLUDED_SCOPE)
+
+    for key in ("topic", "main_question"):
         if not isinstance(value[key], str) or not value[key].strip():
             raise ValueError(f"LLM response field {key} must be a non-empty string")
     if not _string_array(value["sub_questions"]):
@@ -158,6 +162,13 @@ def _validate_plan(value: Any) -> dict[str, Any]:
         raise ValueError("initial_queries must be a non-empty array")
     value["initial_queries"] = _validate_queries(queries)
     return value
+
+
+def _fill_default(value: dict[str, Any], key: str, default: str) -> None:
+    if not isinstance(value.get(key), str) or not value[key].strip():
+        value[key] = default
+    else:
+        value[key] = value[key].strip()
 
 
 def _validate_queries(value: list[Any]) -> list[dict[str, str]]:

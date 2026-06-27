@@ -6,10 +6,11 @@ from typing import Any, Callable
 
 from langchain_core.tools import BaseTool, StructuredTool
 
+from taskboard_agent.llm import LLMResponse
 from taskboard_agent.skill_runtime import ScriptedSkillRunner
 from taskboard_agent.skills import SkillRegistry
 from taskboard_agent.tool_loader import ToolRuntimeContext, ToolScriptCatalog
-from taskboard_agent.tools import is_planner_visible, tool_risk
+from taskboard_agent.tools import execute_tool, is_planner_visible, tool_risk
 
 
 ROOT = Path(__file__).parents[1]
@@ -263,6 +264,66 @@ def test_web_research_report_runs_without_purpose_and_defaults_public_audience()
     assert observed_issue["inferred"]["audience"] == "SNS・ブログ上の不特定多数"
 
 
+def test_web_research_report_runs_with_topic_only_subject() -> None:
+    calls: list[str] = []
+
+    def plan_web_research(issue_json: str) -> dict[str, Any]:
+        calls.append("plan")
+        issue = json.loads(issue_json)
+        assert issue["inferred"]["topic"] == "パーソナルAIアシスタントの業界動向とユースケース"
+        assert issue["inferred"]["purpose"] == "未指定"
+        return {
+            "ok": True,
+            "plan": {
+                "topic": "パーソナルAIアシスタントの業界動向とユースケース",
+                "purpose": "未指定",
+                "audience": "SNS・ブログ上の不特定多数",
+                "target_period": "特に指定なし",
+                "target_region": "指定なし",
+                "target_domain": "指定なし",
+                "excluded_scope": "なし",
+                "main_question": "どのような方向性が求められているか",
+                "sub_questions": ["主要ユースケースは何か"],
+                "initial_queries": [
+                    {
+                        "query": "personal AI assistant use cases",
+                        "purpose": "ユースケースを確認する",
+                    }
+                ],
+                "notes": [],
+            },
+        }
+
+    result = _run(
+        {
+            "plan_web_research": plan_web_research,
+            "web_search_pages": lambda **arguments: _search_result(arguments["query"]),
+            "evaluate_research_coverage": lambda **arguments: {
+                "ok": True,
+                "evaluation": {
+                    "sufficient": True,
+                    "summary": "十分です。",
+                    "covered_points": ["ユースケース"],
+                    "missing_points": [],
+                    "additional_queries": [],
+                    "stop_reason": "sufficient",
+                },
+            },
+            "compose_research_report": lambda **arguments: {
+                "ok": True,
+                "report": _report("パーソナルAIアシスタントの業界動向とユースケース"),
+            },
+        },
+        subject="パーソナルAIアシスタントの業界動向とユースケース",
+        description="",
+    )
+
+    assert result.status == "processed"
+    assert calls == ["plan"]
+    assert result.events[-1].notes
+    assert result.events[-1].notes.startswith("# リサーチレポート：パーソナルAIアシスタント")
+
+
 def test_web_research_report_needs_user_when_topic_is_missing() -> None:
     calls: list[str] = []
 
@@ -321,3 +382,45 @@ def test_web_research_report_skill_and_internal_tools_are_registered() -> None:
     ]
     assert all(tool_risk(tool) == "read" for tool in tools)
     assert all(not is_planner_visible(tool) for tool in tools)
+
+
+def test_plan_web_research_defaults_blank_optional_fields() -> None:
+    class FakeLLM:
+        def complete(self, *_args: Any, **_kwargs: Any) -> LLMResponse:
+            return LLMResponse(
+                json.dumps(
+                    {
+                        "topic": "生成AI",
+                        "purpose": "",
+                        "audience": "",
+                        "target_period": "",
+                        "target_region": "",
+                        "target_domain": "",
+                        "excluded_scope": "",
+                        "main_question": "生成AIで何が重要か",
+                        "sub_questions": ["主要論点は何か"],
+                        "initial_queries": [
+                            {"query": "生成AI 動向", "purpose": "動向を確認する"}
+                        ],
+                        "notes": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    catalog = ToolScriptCatalog(
+        ROOT / "tool_scripts",
+        ToolRuntimeContext(services={"llm": FakeLLM()}, settings={}),
+    )
+    tool = catalog.tools_for(("plan_web_research",))[0]
+
+    result = execute_tool(tool, {"issue_json": json.dumps({"description": "テーマ: 生成AI"})}).content
+
+    assert result["ok"] is True
+    plan = result["plan"]
+    assert plan["purpose"] == "未指定"
+    assert plan["audience"] == "SNS・ブログ上の不特定多数"
+    assert plan["target_period"] == "特に指定なし"
+    assert plan["target_region"] == "指定なし"
+    assert plan["target_domain"] == "指定なし"
+    assert plan["excluded_scope"] == "なし"

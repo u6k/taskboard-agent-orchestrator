@@ -19,7 +19,13 @@ from taskboard_agent.task_executor import (
     TaskPlanningError,
     parse_task_plan,
 )
-from taskboard_agent.structured_output import task_plan_response_format
+from taskboard_agent.structured_output import (
+    generic_execution_response_format,
+    revision_plan_response_format,
+    skill_execution_response_format,
+    task_plan_response_format,
+    tool_execution_response_format,
+)
 from taskboard_agent.tools import ToolExecutionError, ToolExecutionResult
 
 
@@ -40,6 +46,21 @@ class FakeLLM:
         self.messages.append(messages)
         self.response_formats.append(response_format)
         return LLMResponse(content=self.responses.pop(0))
+
+
+def _assert_strict_objects(schema: Any, path: str = "$") -> None:
+    if not isinstance(schema, dict):
+        return
+    schema_type = schema.get("type")
+    schema_types = schema_type if isinstance(schema_type, list) else [schema_type]
+    if "object" in schema_types:
+        assert schema.get("additionalProperties") is False, path
+    for key, value in schema.items():
+        if isinstance(value, dict):
+            _assert_strict_objects(value, f"{path}.{key}")
+        elif isinstance(value, list):
+            for index, child_schema in enumerate(value):
+                _assert_strict_objects(child_schema, f"{path}.{key}[{index}]")
 
 
 class FakeSkillRegistry:
@@ -375,6 +396,26 @@ def test_parse_task_plan_reads_steps_and_limitations() -> None:
     assert plan.limitations == ("社内規程への適合は未確認",)
 
 
+def test_parse_task_plan_reads_key_value_array_step_arguments() -> None:
+    plan = parse_task_plan(
+        '{"decision":"use_tools","reason":"検索する",'
+        '"skill_name":null,"tool_names":["web_search_pages"],"target_url":null,'
+        '"task_input":null,"user_request":null,'
+        '"steps":[{"kind":"tool","name":"web_search_pages","purpose":"検索する",'
+        '"arguments":[{"key":"query","value":"生成AI 動向"},{"key":"max_results","value":"5"}]}],'
+        '"limitations":[]}'
+    )
+
+    assert plan.steps == (
+        TaskStep(
+            kind="tool",
+            name="web_search_pages",
+            purpose="検索する",
+            arguments={"query": "生成AI 動向", "max_results": "5"},
+        ),
+    )
+
+
 def test_parse_task_plan_repairs_empty_step_purpose_from_task_input() -> None:
     plan = parse_task_plan(
         '{"decision":"use_skill","reason":"対象記事を要約して登録する",'
@@ -514,6 +555,30 @@ def test_task_plan_schema_marks_core_text_fields_non_empty() -> None:
     assert schema["properties"]["reason"]["minLength"] == 1
     step_schema = schema["properties"]["steps"]["items"]
     assert step_schema["properties"]["purpose"]["minLength"] == 1
+
+
+def test_task_plan_response_formats_are_openai_strict_object_schemas() -> None:
+    formats = [
+        generic_execution_response_format(),
+        task_plan_response_format(
+            skill_names=["web-briefing-bookmark"],
+            tool_names=["web_search_pages"],
+        ),
+        revision_plan_response_format(
+            skill_names=["web-briefing-bookmark"],
+            tool_names=["web_search_pages"],
+        ),
+        skill_execution_response_format(),
+        tool_execution_response_format(),
+    ]
+
+    for response_format in formats:
+        _assert_strict_objects(response_format["json_schema"]["schema"])
+
+    arguments_schema = formats[1]["json_schema"]["schema"]["properties"]["steps"]["items"]["properties"]["arguments"]
+    argument_items = arguments_schema["anyOf"][0]["items"]
+    assert argument_items["additionalProperties"] is False
+    assert set(argument_items["properties"]) == {"key", "value"}
 
 
 def test_task_planner_retry_prompt_includes_field_specific_repair_hint() -> None:

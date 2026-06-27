@@ -1204,7 +1204,7 @@ def _parse_task_steps(
         name = _normalize_json_null(item.get("name"))
         if name is not None and not isinstance(name, str):
             raise TaskPlanningError("task plan step name must be a string or null")
-        arguments = _normalize_json_null(item.get("arguments"))
+        arguments = _parse_step_arguments(_normalize_json_null(item.get("arguments")))
         if arguments is not None and not isinstance(arguments, dict):
             raise TaskPlanningError("task plan step arguments must be an object or null")
         steps.append(
@@ -1216,6 +1216,26 @@ def _parse_task_steps(
             )
         )
     return tuple(steps)
+
+
+def _parse_step_arguments(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, list):
+        raise TaskPlanningError("task plan step arguments must be an object, key/value array, or null")
+    arguments: dict[str, Any] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            raise TaskPlanningError("task plan step argument row must be an object")
+        key = item.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise TaskPlanningError("task plan step argument key must be a non-empty string")
+        if "value" not in item:
+            raise TaskPlanningError("task plan step argument row missing value")
+        arguments[key.strip()] = item["value"]
+    return arguments
 
 
 def _task_step_purpose_fallback(
@@ -1705,7 +1725,7 @@ def _build_planning_prompt(
         "- toolステップはnameに利用可能なtoolのnameを正確に入れる。説明文、表示名、括弧付き表記を混ぜない。\n"
         "- skillステップはnameに利用可能なskillのnameを正確に入れる。説明文、表示名、括弧付き表記を混ぜない。\n"
         "- ユーザーが `web_search_pages` のようなtool名を明示した場合、nameにはその文字列だけを入れる。\n"
-        "- argumentsには実行引数を入れる。\n"
+        "- argumentsには実行引数をkey/value配列で入れる。例: [{\"key\":\"query\",\"value\":\"検索語\"}]。引数が不要な場合はnullにする。\n"
         "- llmステップはname=null、purposeにLLMで行う作業を具体的に入れる。\n"
         "- unavailableステップはname=null、purposeに実行できない作業と理由を入れる。\n"
         "- limitationsには未確認事項、外部制約、実行できないことを短く列挙する。\n"
