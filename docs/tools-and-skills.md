@@ -18,6 +18,7 @@ skillは、特定の業務を実行するための手順書である。`SKILL.md
 | --- | --- | --- | --- | --- |
 | `web-briefing-bookmark` | `write` | `run.py` | 指定URLのWebページ本文を取得し、ブリーフィング要約を作成してLinkAceへ登録または更新する。 | `linkace_find_link`, `fetch_web_page`, `summarize_briefing`, `linkace_add_link` |
 | `weekly-docx-report-extractor` | `read` | `run.py` | Redmineチケットに添付された日本語の週報DOCXを解析し、案件進捗、障害・ネガティブ情報、営業情報、自由意見を管理職向けに要約する。 | `extract_redmine_docx`, `summarize_weekly_docx` |
+| `web-research-report` | `read` | `run.py` | チケットの調査テーマから検索キーワードを設計し、Web検索、根拠十分性評価、追加検索を反復してMarkdownリサーチレポートを作成する。 | `plan_web_research`, `web_search_pages`, `evaluate_research_coverage`, `compose_research_report` |
 
 ## Tools
 
@@ -28,6 +29,9 @@ toolは `tool_scripts/{tool_name}.py` として定義する。各toolは `create
 | `fetch_web_page` | `read` | yes | 指定URLのWebページから最終URL、タイトル、本文を抽出する。 |
 | `web_search_pages` | `read` | yes | DuckDuckGoで検索し、検索結果と各ページ本文の取得結果を返す。 |
 | `summarize_briefing` | `read` | yes | Webページ本文からブリーフィング要約を生成する。 |
+| `plan_web_research` | `read` | no | `web-research-report` 内部用。チケット内容から調査計画、リサーチクエスチョン、初期検索キーワードを生成する。 |
+| `evaluate_research_coverage` | `read` | no | `web-research-report` 内部用。収集済みWeb情報の根拠十分性を評価し、不足論点と追加検索キーワードを生成する。 |
+| `compose_research_report` | `read` | no | `web-research-report` 内部用。収集済みWeb情報と根拠評価から最終Markdownリサーチレポートを生成する。 |
 | `linkace_check_auth` | `read` | yes | LinkAce API tokenの認証状態を確認する。 |
 | `linkace_find_link` | `read` | yes | 指定URLがLinkAceに登録済みか確認する。 |
 | `linkace_add_link` | `write` | yes | URL、タイトル、ブリーフィング要約をLinkAceへ登録する。dry-runではpayloadだけ返す。 |
