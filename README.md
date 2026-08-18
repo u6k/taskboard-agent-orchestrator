@@ -87,7 +87,7 @@ LINKACE_SUMMARIZED_LIST_ID=10
 LANGGRAPH_CHECKPOINT_DB_PATH=.taskboard-agent/checkpoints.sqlite3
 ```
 
-`agents.example.toml` を `agents.toml` にコピーし、Redmine担当者ごとのAPIキー、言語モデル、LLM endpoint、LLM APIキーを設定します。`system_prompt_file` は任意です。
+`agents.example.toml` を `agents.toml` にコピーし、Redmine担当者ごとのAPIキー、言語モデル、LLM endpoint、LLM APIキーを設定します。`llm_timeout_seconds` と `system_prompt_file` は任意です。
 
 ```powershell
 Copy-Item agents.example.toml agents.toml

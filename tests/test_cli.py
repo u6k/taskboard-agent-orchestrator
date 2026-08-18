@@ -94,6 +94,7 @@ redmine_api_key = "redmine-first"
 llm_model = "provider/first"
 llm_api_base = "https://first.example.test/v1"
 llm_api_key = "llm-first"
+llm_timeout_seconds = 300
 
 [[agents]]
 id = "second"
@@ -102,6 +103,7 @@ redmine_api_key = "redmine-second"
 llm_model = "provider/second"
 llm_api_base = "https://second.example.test/v1"
 llm_api_key = "llm-second"
+llm_timeout_seconds = 1200
 """.strip(),
         encoding="utf-8",
     )
@@ -136,6 +138,7 @@ llm_api_key = "llm-second"
             "https://first.example.test/v1",
             "https://second.example.test/v1",
         ]
+        assert [llm.timeout_seconds for llm in direct_llms] == [300, 1200]
 
     assert redmine_keys == ["redmine-first", "redmine-second"]
     assert chat_calls == [
@@ -143,10 +146,12 @@ llm_api_key = "llm-second"
             "model": "provider/first",
             "api_base": "https://first.example.test/v1",
             "api_key": "llm-first",
+            "request_timeout": 300,
         },
         {
             "model": "provider/second",
             "api_base": "https://second.example.test/v1",
             "api_key": "llm-second",
+            "request_timeout": 1200,
         },
     ]

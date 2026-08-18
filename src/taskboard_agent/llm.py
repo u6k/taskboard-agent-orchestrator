@@ -40,11 +40,13 @@ class LiteLLMClient:
         *,
         api_base: str | None = None,
         api_key: str | None = None,
+        timeout_seconds: int | None = None,
         system_prompt: str | None = None,
     ) -> None:
         self._model = model
         self._api_base = api_base
         self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
         self._system_prompt = system_prompt.strip() if system_prompt else None
 
     @property
@@ -54,6 +56,10 @@ class LiteLLMClient:
     @property
     def api_base(self) -> str | None:
         return self._api_base
+
+    @property
+    def timeout_seconds(self) -> int | None:
+        return self._timeout_seconds
 
     def supports_function_calling(self) -> bool:
         try:
@@ -77,6 +83,8 @@ class LiteLLMClient:
             kwargs["base_url"] = self._api_base
         if self._api_key is not None:
             kwargs["api_key"] = self._api_key
+        if self._timeout_seconds is not None:
+            kwargs["timeout"] = self._timeout_seconds
         if tools is not None:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice

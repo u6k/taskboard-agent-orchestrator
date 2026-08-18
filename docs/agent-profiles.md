@@ -17,6 +17,7 @@ redmine_api_key = "redmine-api-key-for-research-agent"
 llm_model = "openai/gpt-4.1-mini"
 llm_api_base = "https://api.openai.com/v1"
 llm_api_key = "llm-api-key-for-research-agent"
+llm_timeout_seconds = 1200
 system_prompt_file = "agent-prompts/research-agent.md"
 ```
 
@@ -29,6 +30,7 @@ system_prompt_file = "agent-prompts/research-agent.md"
 - `llm_model`: LiteLLMへ渡すモデル名。
 - `llm_api_base`: 任意。省略時はLiteLLMがモデル名から既定エンドポイントを解決する。
 - `llm_api_key`: LLM APIキー。認証不要のローカルエンドポイントでは空文字を明示できる。
+- `llm_timeout_seconds`: 任意。1回のLLM呼び出しを待つ秒数。正の整数を指定し、省略時はLiteLLMの既定値を使う。
 - `system_prompt_file`: 任意。TOMLファイルからの相対パス。省略時は担当者固有のsystem messageを追加しない。
 
 `id` と `redmine_user_id` はそれぞれ重複できない。指定されたsystem promptファイルは存在し、空でない必要がある。有効なプロフィールが1件もない設定は起動時に拒否する。
@@ -43,7 +45,7 @@ Redmine URL、ステータスID、LinkAce、LangGraph checkpointなど全エー�
 
 ## LLM設定の適用範囲
 
-プロフィールのモデル、API endpoint、API keyは、LiteLLM直接呼び出しとChatLiteLLM経由のLangChain agentの両方へ同じ値を渡す。これにより、計画とtool/skill実行で接続先が分かれることを防ぐ。
+プロフィールのモデル、API endpoint、API key、タイムアウトは、LiteLLM直接呼び出しとChatLiteLLM経由のLangChain agentの両方へ同じ値を渡す。これにより、計画とtool/skill実行で接続先や待機時間が分かれることを防ぐ。
 
 system promptがある場合は、計画、再計画、LLM step、tool/skill agent、toolやscripted skill内部のLLM処理へ補助system messageとして適用する。共通のStructured Outputs、tool policy、dry-run、承認、Redmine更新規則を優先し、プロフィールのpromptからそれらを変更できないようにする。
 

@@ -150,7 +150,7 @@
 
 目的:
 
-- 複数のRedmine担当者を、それぞれ異なるモデル、接続先、資格情報、任意のsystem promptで処理する
+- 複数のRedmine担当者を、それぞれ異なるモデル、接続先、資格情報、任意のタイムアウトとsystem promptで処理する
 
 方針:
 
@@ -162,7 +162,7 @@
 
 完了条件:
 
-- 担当者ごとにRedmine APIキー、モデル、endpoint、LLM APIキーを切り替えられる
+- 担当者ごとにRedmine APIキー、モデル、endpoint、LLM APIキー、LLMタイムアウトを切り替えられる
 - system promptファイルは任意で、未設定時も既存の共通指示だけで実行できる
 - 各巡回で有効な全プロフィールが処理機会を持つ
 - 担当者不一致の明示チケットを更新しない
@@ -171,7 +171,7 @@
 
 - `agents.toml` から有効なプロフィールを読み、担当者別runtimeを構築する
 - `run-once --agent` が担当者一致を検証し、daemonがプロフィールを1件ずつ巡回する
-- LiteLLM直接呼び出しとChatLiteLLM agentへ同じモデル、endpoint、APIキー、任意のsystem promptを適用する
+- LiteLLM直接呼び出しとChatLiteLLM agentへ同じモデル、endpoint、APIキー、任意のタイムアウトとsystem promptを適用する
 - 設定済みの全RedmineエージェントユーザーをLangGraph会話上のAI投稿者として扱う
 
 ## 実装時の原則

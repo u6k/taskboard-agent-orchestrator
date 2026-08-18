@@ -64,6 +64,7 @@ redmine_api_key = "redmine-research-key"
 llm_model = "openai/test-model"
 llm_api_base = "https://llm.example.test/v1"
 llm_api_key = "llm-research-key"
+llm_timeout_seconds = 1200
 system_prompt_file = "prompts/research.md"
 
 [[agents]]
@@ -90,10 +91,12 @@ llm_api_key = ""
     assert research.llm_model == "openai/test-model"
     assert research.llm_api_base == "https://llm.example.test/v1"
     assert research.llm_api_key == "llm-research-key"
+    assert research.llm_timeout_seconds == 1200
     assert research.system_prompt == "根拠を明示してください。"
     assert research.system_prompt_file == prompt
     assert local.llm_api_base is None
     assert local.llm_api_key == ""
+    assert local.llm_timeout_seconds is None
     assert local.system_prompt is None
     assert local.system_prompt_file is None
 
@@ -178,6 +181,30 @@ def test_load_config_rejects_all_agents_disabled(
     agents_file = _write_minimal_agents(tmp_path, profile_extra="enabled = false")
 
     with pytest.raises(ConfigError, match="enable at least one agent"):
+        load_config(env_file, agents_file)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["0", "-1", '"1200"', "1.5", "true"],
+)
+def test_load_config_rejects_invalid_llm_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    value: str,
+) -> None:
+    clear_env(monkeypatch)
+    env_file = tmp_path / ".env"
+    _write_shared_env(env_file)
+    agents_file = _write_minimal_agents(
+        tmp_path,
+        profile_extra=f"llm_timeout_seconds = {value}",
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match="llm_timeout_seconds must be a positive integer",
+    ):
         load_config(env_file, agents_file)
 
 

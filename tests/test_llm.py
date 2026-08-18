@@ -33,6 +33,7 @@ def test_litellm_client_reads_text_response(monkeypatch: pytest.MonkeyPatch) -> 
     def fake_completion(**kwargs: object) -> dict[str, object]:
         assert kwargs["model"] == "test-model"
         assert kwargs["messages"] == [{"role": "user", "content": "hello"}]
+        assert "timeout" not in kwargs
         return {"choices": [{"message": {"content": "こんにちは"}}]}
 
     monkeypatch.setattr("taskboard_agent.llm.litellm.completion", fake_completion)
@@ -57,6 +58,7 @@ def test_litellm_client_applies_profile_connection_and_system_prompt(
         assert kwargs["model"] == "provider/test-model"
         assert kwargs["base_url"] == "https://llm.example.test/v1"
         assert kwargs["api_key"] == "profile-key"
+        assert kwargs["timeout"] == 1200
         messages = kwargs["messages"]
         assert isinstance(messages, list)
         assert messages[0] == {"role": "system", "content": "共通規則"}
@@ -72,6 +74,7 @@ def test_litellm_client_applies_profile_connection_and_system_prompt(
         "provider/test-model",
         api_base="https://llm.example.test/v1",
         api_key="profile-key",
+        timeout_seconds=1200,
         system_prompt="根拠を明示する",
     ).complete(original_messages)
 
