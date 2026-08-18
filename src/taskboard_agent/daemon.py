@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from types import FrameType
 from typing import Callable, Protocol
 
-from taskboard_agent.config import AppConfig
+from taskboard_agent.config import AgentProfileConfig, AppConfig
 from taskboard_agent.workflow import (
     RedminePort,
     RunResult,
@@ -24,6 +24,7 @@ class RunOnceFunc(Protocol):
         self,
         *,
         config: AppConfig,
+        agent: AgentProfileConfig,
         redmine: RedminePort,
         task_executor: TaskExecutorPort,
         dry_run: bool = False,
@@ -40,11 +41,17 @@ class DaemonResult:
     stopped_by_signal: bool = False
 
 
+@dataclass(frozen=True)
+class AgentExecutionContext:
+    profile: AgentProfileConfig
+    redmine: RedminePort
+    task_executor: TaskExecutorPort
+
+
 def run_daemon(
     *,
     config: AppConfig,
-    redmine: RedminePort,
-    task_executor: TaskExecutorPort,
+    agents: tuple[AgentExecutionContext, ...],
     dry_run: bool = False,
     interval_seconds: int = 60,
     max_iterations: int | None = None,
@@ -56,6 +63,8 @@ def run_daemon(
         raise ValueError("interval_seconds must be a positive integer")
     if max_iterations is not None and max_iterations <= 0:
         raise ValueError("max_iterations must be a positive integer")
+    if not agents:
+        raise ValueError("agents must not be empty")
 
     stop_requested = False
     stopped_by_signal = False
@@ -87,38 +96,48 @@ def run_daemon(
                 break
 
             iterations += 1
-            result = run_once_func(
-                config=config,
-                redmine=redmine,
-                task_executor=task_executor,
-                dry_run=dry_run,
-                issue_id=None,
-            )
+            processed_in_iteration = False
+            for agent_context in agents:
+                if stop_requested:
+                    break
+                result = run_once_func(
+                    config=config,
+                    agent=agent_context.profile,
+                    redmine=agent_context.redmine,
+                    task_executor=agent_context.task_executor,
+                    dry_run=dry_run,
+                    issue_id=None,
+                )
 
-            if result.status == "no_issue":
-                no_issue += 1
+                if result.status == "no_issue":
+                    no_issue += 1
+                    continue
+
+                processed += 1
+                processed_in_iteration = True
                 logger.info(
-                    "処理対象チケットがないため待機します interval_seconds=%s iteration=%s",
-                    interval_seconds,
+                    "チケット処理を完了しました agent_id=%s issue_id=%s status=%s iteration=%s",
+                    agent_context.profile.id,
+                    result.issue_id,
+                    result.status,
                     iterations,
                 )
-                if max_iterations is not None and iterations >= max_iterations:
-                    break
-                try:
-                    sleeper(interval_seconds)
-                except KeyboardInterrupt:
-                    stop_requested = True
-                    stopped_by_signal = True
-                    logger.info("デーモン待機中に停止要求を受け付けました")
-                continue
 
-            processed += 1
+            if processed_in_iteration or stop_requested:
+                continue
             logger.info(
-                "チケット処理を完了しました issue_id=%s status=%s iteration=%s",
-                result.issue_id,
-                result.status,
+                "全エージェントに処理対象がないため待機します interval_seconds=%s iteration=%s",
+                interval_seconds,
                 iterations,
             )
+            if max_iterations is not None and iterations >= max_iterations:
+                break
+            try:
+                sleeper(interval_seconds)
+            except KeyboardInterrupt:
+                stop_requested = True
+                stopped_by_signal = True
+                logger.info("デーモン待機中に停止要求を受け付けました")
     finally:
         for signum, handler in reversed(previous_handlers):
             signal.signal(signum, handler)

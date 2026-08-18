@@ -237,7 +237,7 @@ def test_initial_run_creates_ticket_conversation_and_interrupts() -> None:
         task_orchestrator=FakeOrchestrator(),  # type: ignore[arg-type]
         llm=FakeLLM([]),
         checkpointer=InMemorySaver(),
-        ai_user_id=42,
+        ai_user_ids={42},
     )
     events: list[SkillEvent] = []
 
@@ -254,6 +254,34 @@ def test_initial_run_creates_ticket_conversation_and_interrupts() -> None:
     assert isinstance(state["messages"][0], HumanMessage)
     assert "案内文を作成してください" in state["messages"][0].content
     assert isinstance(state["messages"][-1], AIMessage)
+
+
+def test_initial_run_treats_all_configured_agent_journals_as_ai_messages() -> None:
+    graph = TicketConversationGraph(
+        task_orchestrator=FakeOrchestrator(),  # type: ignore[arg-type]
+        llm=FakeLLM([]),
+        checkpointer=InMemorySaver(),
+        ai_user_ids={42, 43},
+    )
+
+    graph.run(
+        issue=_issue(
+            journals=[
+                {"id": 1, "user": {"id": 43}, "notes": "別エージェントの結果"},
+                {"id": 2, "user": {"id": 7}, "notes": "人間からのコメント"},
+            ]
+        )
+    )
+
+    messages = graph.conversation_state(123)["messages"]
+    agent_message = next(
+        message for message in messages if message.content == "別エージェントの結果"
+    )
+    human_message = next(
+        message for message in messages if message.content == "人間からのコメント"
+    )
+    assert isinstance(agent_message, AIMessage)
+    assert isinstance(human_message, HumanMessage)
 
 
 def test_initial_plan_steps_are_saved_in_graph_state() -> None:
@@ -278,7 +306,7 @@ def test_initial_plan_steps_are_saved_in_graph_state() -> None:
         ),
         llm=FakeLLM([]),
         checkpointer=InMemorySaver(),
-        ai_user_id=42,
+        ai_user_ids={42},
     )
 
     events: list[SkillEvent] = []
@@ -369,7 +397,7 @@ def test_step_needs_user_keeps_stopped_step_and_pending_remainder() -> None:
         ),
         llm=FakeLLM([]),
         checkpointer=InMemorySaver(),
-        ai_user_id=42,
+        ai_user_ids={42},
     )
     events: list[SkillEvent] = []
 
@@ -405,7 +433,7 @@ def test_step_failure_is_recorded_as_progress_and_keeps_resume_position() -> Non
         ),
         llm=FakeLLM([]),
         checkpointer=InMemorySaver(),
-        ai_user_id=42,
+        ai_user_ids={42},
     )
     events: list[SkillEvent] = []
 
@@ -433,7 +461,7 @@ def test_resume_adds_only_new_human_comment_and_publishes_revision_first() -> No
         task_orchestrator=orchestrator,  # type: ignore[arg-type]
         llm=llm,
         checkpointer=InMemorySaver(),
-        ai_user_id=42,
+        ai_user_ids={42},
     )
     graph.run(issue=_issue())
     events: list[SkillEvent] = []
@@ -482,7 +510,7 @@ def test_sqlite_checkpoint_resumes_with_a_new_graph_instance(tmp_path: Any) -> N
             task_orchestrator=first_orchestrator,  # type: ignore[arg-type]
             llm=FakeLLM([]),
             checkpointer=checkpointer,
-            ai_user_id=42,
+            ai_user_ids={42},
         )
         first_graph.run(issue=_issue())
 
@@ -492,7 +520,7 @@ def test_sqlite_checkpoint_resumes_with_a_new_graph_instance(tmp_path: Any) -> N
             task_orchestrator=second_orchestrator,  # type: ignore[arg-type]
             llm=FakeLLM([_revision_response()]),
             checkpointer=checkpointer,
-            ai_user_id=42,
+            ai_user_ids={42},
         )
         second_graph.run(
             issue=_issue(
@@ -512,7 +540,7 @@ def test_failed_revision_restarts_in_progress_before_execution() -> None:
         task_orchestrator=orchestrator,  # type: ignore[arg-type]
         llm=FakeLLM([_revision_response()]),
         checkpointer=InMemorySaver(),
-        ai_user_id=42,
+        ai_user_ids={42},
     )
     graph.run(issue=_issue())
     resumed_issue = _issue(
@@ -550,7 +578,7 @@ def test_resume_question_is_planned_and_executed_from_conversation() -> None:
         task_orchestrator=orchestrator,  # type: ignore[arg-type]
         llm=llm,
         checkpointer=InMemorySaver(),
-        ai_user_id=42,
+        ai_user_ids={42},
     )
     graph.run(issue=_issue())
     execution_count = len(orchestrator.executions)
@@ -612,7 +640,7 @@ def test_revision_plan_preserves_step_based_work() -> None:
         task_orchestrator=orchestrator,  # type: ignore[arg-type]
         llm=llm,
         checkpointer=InMemorySaver(),
-        ai_user_id=42,
+        ai_user_ids={42},
     )
     graph.run(issue=_issue())
 
@@ -682,7 +710,7 @@ def test_search_artifact_is_saved_to_conversation_context() -> None:
         task_orchestrator=FakeOrchestrator(artifacts=(artifact,)),  # type: ignore[arg-type]
         llm=FakeLLM([]),
         checkpointer=InMemorySaver(),
-        ai_user_id=42,
+        ai_user_ids={42},
     )
 
     graph.run(issue=_issue())

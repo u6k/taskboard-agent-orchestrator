@@ -9,7 +9,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 
-from taskboard_agent.llm import LLMResponse, LLMToolCall
+from taskboard_agent.llm import LLMResponse, LLMToolCall, with_agent_system_prompt
 from taskboard_agent.tools import ToolExecutionResult, require_tool_policy
 
 
@@ -27,9 +27,11 @@ class LangChainAgentRunner:
         *,
         model: Any,
         max_steps: int = 8,
+        system_prompt: str | None = None,
     ) -> None:
         self._model = model
         self._max_steps = max_steps
+        self._system_prompt = system_prompt
 
     def run(
         self,
@@ -59,7 +61,7 @@ class LangChainAgentRunner:
             interrupt_after=["tools"] if return_after_tool_names else None,
         )
         result = agent.invoke(
-            {"messages": messages},
+            {"messages": with_agent_system_prompt(messages, self._system_prompt)},
             config={"recursion_limit": max(self._max_steps * 2, 2)},
         )
         output_messages = tuple(result.get("messages", ()))

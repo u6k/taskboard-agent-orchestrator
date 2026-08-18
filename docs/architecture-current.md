@@ -4,7 +4,7 @@
 
 ## 全体像
 
-現在の実装は、Redmineをタスクボードとして使うCLIである。`run-once` は1件だけ処理して終了し、`run-daemon` は単一プロセス内で担当チケットをpollして継続処理する。CLIが依存オブジェクトを組み立て、Redmineから対象チケットを取得し、LangGraphでチケット単位の会話状態を保持しながら、TaskOrchestratorが計画と実行分岐を担当する。
+現在の実装は、Redmineをタスクボードとして使うCLIである。`run-once` は指定されたエージェントプロフィールで1件だけ処理して終了し、`run-daemon` は単一プロセス内で有効なプロフィールを順番にpollして継続処理する。CLIがプロフィールごとの依存オブジェクトを組み立て、Redmineから対象チケットを取得し、LangGraphでチケット単位の会話状態を保持しながら、TaskOrchestratorが計画と実行分岐を担当する。
 
 ```text
 CLI
@@ -29,8 +29,8 @@ CLI
 
 `taskboard-agent run-once` と `taskboard-agent run-daemon` のエントリポイントである。
 
-- `.env` と環境変数から設定を読む
-- `RedmineClient`, `LiteLLMClient`, `ChatLiteLLM`, `SkillRegistry`, `ToolScriptCatalog`, `TaskOrchestrator`, `TicketConversationGraph` を組み立てる
+- `.env` から共有設定、TOMLから担当者別エージェントプロフィールを読む
+- プロフィールごとに `RedmineClient`, `LiteLLMClient`, `ChatLiteLLM`, `ToolScriptCatalog`, `TaskOrchestrator`, `TicketConversationGraph` を組み立てる
 - `--dry-run` では `InMemorySaver` を使う
 - 通常実行ではSQLite Checkpointerを使う
 - `run-once` では `workflow.run_once()` を1回呼び、結果を標準出力へ表示する
@@ -40,9 +40,9 @@ CLI
 
 単一プロセスの常駐ループを担当する。
 
-- `workflow.run_once()` を1巡ごとに呼び、常にAI担当チケット検索から始める
+- 各巡回で有効な全プロフィールについて `workflow.run_once()` を1回ずつ呼ぶ
 - `RunResult.status == "no_issue"` の場合だけ `interval_seconds` 秒待機する
-- `no_issue` 以外は成功、判断待ち、失敗戻しを問わず1件処理済みとして扱い、待機せず次の検索へ進む
+- 全プロフィールが `no_issue` の場合だけ待機し、1件でも処理した場合は待機せず次の巡回へ進む
 - `--max-iterations` は開発時やテスト時に指定できる
 - `--dry-run` のdaemon実行では、同じチケットの再処理を避けるため `--max-iterations` を必須にする
 
@@ -51,7 +51,7 @@ CLI
 Redmineチケットの取得と、実行イベントのRedmine反映を担当する。
 
 - `--issue-id` があればそのチケットを取得する
-- 指定がなければAIユーザーに割り当てられた未完了チケットを1件取得する
+- 指定がなければ選択されたプロフィールのRedmine担当者に割り当てられた未完了チケットを1件取得する
 - `SkillEvent` をRedmineコメント、ステータス、担当者更新へ変換する
 - `start` で進行中にする
 - `progress` でコメントを追加する

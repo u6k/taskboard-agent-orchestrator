@@ -1,0 +1,20 @@
+version = 1
+
+[[agents]]
+id = "research-agent"
+enabled = true
+redmine_user_id = 123
+redmine_api_key = "replace-with-redmine-api-key"
+llm_model = "openai/gpt-4.1-mini"
+llm_api_base = "https://api.openai.com/v1"
+llm_api_key = "replace-with-llm-api-key"
+system_prompt_file = "agent-prompts/research-agent.md"
+
+[[agents]]
+id = "local-agent"
+enabled = false
+redmine_user_id = 124
+redmine_api_key = "replace-with-redmine-api-key"
+llm_model = "lm_studio/replace-with-lm-studio-model-id"
+llm_api_base = "http://localhost:1234/v1"
+llm_api_key = ""

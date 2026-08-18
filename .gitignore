@@ -219,3 +219,6 @@ __marimo__/
 
 # Local LangGraph checkpoints
 .taskboard-agent/
+
+# Local agent profiles may contain API keys
+agents.toml

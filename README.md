@@ -2,7 +2,7 @@
 
 秘書AIとタスクボードを仲介にして、AIエージェントが業務タスクを継続的に処理するための実行基盤です。
 
-初期実装では Redmine をタスクボードとして扱い、AIユーザーに割り当てられたチケットを取得して、依頼内容の理解、計画、スキルまたはtoolの実行、進捗コメント、レビュー戻しまでをCLIで処理します。手動実行向けの one-shot 実行と、常駐して担当チケットをpollするdaemon実行を提供します。
+初期実装では Redmine をタスクボードとして扱い、設定されたAIユーザーに割り当てられたチケットを取得して、依頼内容の理解、計画、スキルまたはtoolの実行、進捗コメント、レビュー戻しまでをCLIで処理します。手動実行向けの one-shot 実行と、複数の担当者を順番にpollするdaemon実行を提供します。
 
 ## 目的
 
@@ -79,44 +79,47 @@ Copy-Item .env.example .env
 
 ```dotenv
 REDMINE_URL=https://redmine.example.com
-REDMINE_API_KEY=replace-with-redmine-api-key
-REDMINE_AI_USER_ID=123
 REDMINE_IN_PROGRESS_STATUS_ID=2
 REDMINE_REVIEW_STATUS_ID=10
-LLM_MODEL=replace-with-litellm-model
 LINKACE_URL=https://linkace.example.com
 LINKACE_API_KEY=replace-with-linkace-api-key
 LINKACE_SUMMARIZED_LIST_ID=10
 LANGGRAPH_CHECKPOINT_DB_PATH=.taskboard-agent/checkpoints.sqlite3
 ```
 
+`agents.example.toml` を `agents.toml` にコピーし、Redmine担当者ごとのAPIキー、言語モデル、LLM endpoint、LLM APIキーを設定します。`system_prompt_file` は任意です。
+
+```powershell
+Copy-Item agents.example.toml agents.toml
+```
+
 `LANGGRAPH_CHECKPOINT_DB_PATH` はチケット単位のLangGraph会話コンテキストを保存するSQLiteファイルです。`--dry-run` ではインメモリCheckpointerを使用するため、このファイルは更新されません。
 
-言語モデルの呼び出しはLiteLLM経由で行います。`LLM_MODEL` には `openai/gpt-4.1-mini`、`anthropic/claude-...`、`gemini/...`、`ollama/...`、`lm_studio/...` などLiteLLMが扱うモデル名を指定し、APIキーやAPI Base URLは各プロバイダが要求する環境変数に設定してください。
+言語モデルの呼び出しはLiteLLM経由で行います。プロフィールの `llm_model` には `openai/gpt-4.1-mini`、`anthropic/claude-...`、`gemini/...`、`ollama/...`、`lm_studio/...` などLiteLLMが扱うモデル名を指定します。`llm_api_base` は省略でき、認証不要のローカルモデルでは `llm_api_key = ""` を指定できます。詳細は [docs/agent-profiles.md](docs/agent-profiles.md) を参照してください。
 
 計画、再計画、実行状態など機械処理する応答にはLiteLLMの `response_format` からStrict JSON Schemaを指定します。利用するプロバイダ、推論サーバー、モデルはStructured Outputsに対応している必要があります。
 
 ## 実行
 
-AIユーザーに割り当てられたRedmineチケットを1件処理します。
+指定したエージェントプロフィールのRedmine担当者に割り当てられたチケットを1件処理します。
 
 ```powershell
-uv run taskboard-agent run-once
+uv run taskboard-agent run-once --agent research-agent
 ```
 
 特定のチケットを直接処理します。
 
 ```powershell
-uv run taskboard-agent run-once --issue-id 123
+uv run taskboard-agent run-once --agent research-agent --issue-id 123
 ```
 
 Redmineや外部サービスを更新せず、依頼理解、スキル選択、tool実行結果だけ確認します。
 
 ```powershell
-uv run taskboard-agent run-once --dry-run
+uv run taskboard-agent run-once --agent research-agent --dry-run
 ```
 
-AIユーザーに割り当てられたRedmineチケットを継続的に処理します。担当チケットが見つかった場合は1件処理後すぐ次の検索を行い、担当チケットがない場合だけ既定60秒待機します。
+有効な全エージェントプロフィールを設定順に巡回し、Redmineチケットを継続的に処理します。1件でも処理した巡回の後はすぐ次の巡回を行い、全担当者にチケットがない場合だけ既定60秒待機します。
 
 ```powershell
 uv run taskboard-agent run-daemon
@@ -137,6 +140,7 @@ uv run taskboard-agent run-daemon --dry-run --max-iterations 1
 ## ドキュメント
 
 - [docs/use-cases.md](docs/use-cases.md): 実装対象ユースケースと成長順
+- [docs/agent-profiles.md](docs/agent-profiles.md): 担当者別エージェント設定と巡回規則
 - [docs/architecture-current.md](docs/architecture-current.md): 現在の実装構造
 - [docs/architecture-target.md](docs/architecture-target.md): 目指すアーキテクチャ
 - [docs/langgraph-ticket-graph.md](docs/langgraph-ticket-graph.md): `TicketConversationGraph` のLangGraphノード、エッジ、state

@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from taskboard_agent.config import AppConfig
+from taskboard_agent.config import AgentProfileConfig, AppConfig
 from taskboard_agent.logging_config import log_trace
 from taskboard_agent.skill_runtime import SkillEvent, SkillEventSink, SkillExecutionResult
 
@@ -49,6 +49,7 @@ class TaskExecutorPort(Protocol):
 @dataclass(frozen=True)
 class RunResult:
     status: str
+    agent_id: str | None = None
     issue_id: int | None = None
     reassigned_to_id: int | None = None
     comments: tuple[str, ...] = ()
@@ -63,6 +64,7 @@ class RunResult:
 def run_once(
     *,
     config: AppConfig,
+    agent: AgentProfileConfig,
     redmine: RedminePort,
     task_executor: TaskExecutorPort,
     dry_run: bool = False,
@@ -72,16 +74,18 @@ def run_once(
         with log_trace("run-once"):
             logger.info(
                 "Redmineの未完了チケットを検索します assigned_to_id=%s dry_run=%s",
-                config.redmine_ai_user_id,
+                agent.redmine_user_id,
                 dry_run,
             )
-            summaries = redmine.find_open_issues_assigned_to(config.redmine_ai_user_id)
+            summaries = redmine.find_open_issues_assigned_to(agent.redmine_user_id)
             if not summaries:
                 logger.warning(
                     "処理対象のチケットがありません assigned_to_id=%s status=no_issue",
-                    config.redmine_ai_user_id,
+                    agent.redmine_user_id,
                 )
-                return RunResult(status="no_issue", dry_run=dry_run)
+                return RunResult(
+                    status="no_issue", agent_id=agent.id, dry_run=dry_run
+                )
         issue_id = _require_issue_id(summaries[0])
     elif issue_id <= 0:
         raise WorkflowError("issue_id must be a positive integer")
@@ -96,6 +100,7 @@ def run_once(
     with log_trace(f"issue#{issue_id}"):
         logger.info("Redmineチケットを取得します issue_id=%s", issue_id)
         issue = redmine.get_issue(issue_id)
+        _require_matching_assignee(issue, agent)
         author_id = _require_author_id(issue)
         logger.info("Redmineチケットを取得しました issue_id=%s author_id=%s", issue_id, author_id)
         comments: list[str] = []
@@ -136,6 +141,7 @@ def run_once(
                 )
             return RunResult(
                 status="agent_failed",
+                agent_id=agent.id,
                 issue_id=issue_id,
                 reassigned_to_id=author_id,
                 comments=tuple(comments),
@@ -156,6 +162,7 @@ def run_once(
             logger.info("dry-runのため外部サービスを更新せず終了します status=dry_run")
             return RunResult(
                 status="dry_run",
+                agent_id=agent.id,
                 issue_id=issue_id,
                 reassigned_to_id=author_id,
                 comments=tuple(comments),
@@ -174,6 +181,7 @@ def run_once(
         )
         return RunResult(
             status=execution.status,
+            agent_id=agent.id,
             issue_id=issue_id,
             reassigned_to_id=author_id,
             comments=tuple(comments),
@@ -262,3 +270,17 @@ def _require_author_id(issue: dict[str, Any]) -> int:
     if not isinstance(author_id, int):
         raise WorkflowError("Redmine issue author did not include an integer id")
     return author_id
+
+
+def _require_matching_assignee(
+    issue: dict[str, Any],
+    agent: AgentProfileConfig,
+) -> None:
+    assigned_to = issue.get("assigned_to")
+    assigned_to_id = assigned_to.get("id") if isinstance(assigned_to, dict) else None
+    if assigned_to_id != agent.redmine_user_id:
+        raise WorkflowError(
+            "Redmine issue assignee does not match agent profile: "
+            f"issue_assignee_id={assigned_to_id} "
+            f"agent_id={agent.id} agent_redmine_user_id={agent.redmine_user_id}"
+        )
