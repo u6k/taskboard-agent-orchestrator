@@ -13,6 +13,7 @@ Redmineは初期のタスクボードであり、操作はMCPではなくPython�
 ```text
 Taskboard Agent Orchestrator
   -> Workflow / Scheduler
+    -> Redmine担当者別プロフィールを順番に巡回する
     -> タスクボードから処理対象を取得
     -> 実行イベントをタスクボードへ反映
   -> TicketConversationGraph
@@ -29,6 +30,8 @@ Taskboard Agent Orchestrator
 ```
 
 `workflow.py` はタスクボードI/Oを担当し、`TicketConversationGraph` は実行状態を管理し、`TaskOrchestrator` は1stepを実行する部品を提供する。最終的には、step列のループを `TaskOrchestrator` 内のforループではなく、LangGraphのノード遷移として表現する。
+
+エージェントプロフィールはRedmine担当者、Redmine APIキー、LLMモデル、endpoint、LLM APIキー、任意のsystem promptを束ねる。初期の複数エージェント実行は単一daemonによる順次巡回とし、同時実行は別要件として扱う。
 
 ## 目標フロー
 

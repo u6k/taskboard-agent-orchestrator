@@ -44,7 +44,7 @@ flowchart TD
 
 | ノード | 責務 | 主なstate更新 |
 | --- | --- | --- |
-| `initialize` | Redmine issue本文とjournalをLangChain messageへ変換し、初期stateを作る。AIユーザーのコメントは `AIMessage`、それ以外は `HumanMessage` として扱う。 | `issue_id`, `issue`, `messages`, `last_ingested_journal_id`, `plan_steps`, `step_results`, `run_status` |
+| `initialize` | Redmine issue本文とjournalをLangChain messageへ変換し、初期stateを作る。設定済みエージェントユーザーのコメントは `AIMessage`、それ以外は `HumanMessage` として扱う。 | `issue_id`, `issue`, `messages`, `last_ingested_journal_id`, `plan_steps`, `step_results`, `run_status` |
 | `initial_plan` | `TaskOrchestrator.create_plan()` で初回計画を作る。旧形式のstepなし計画は実行可能な単一stepへ補完する。 | `current_plan`, `plan_steps`, `current_step_index`, `step_context` |
 | `publish_initial_plan` | 初回計画をRedmine向け `start` イベントとしてemitし、会話履歴にも残す。 | `messages` |
 | `select_next_step` | `pending` または `running` のstepを1件選び、`running` にする。step開始を `progress` イベントとしてemitする。 | `plan_steps`, `current_step_index`, `run_status`, `messages` |
@@ -111,7 +111,7 @@ flowchart TD
    `initialize` から開始する。
 
 2. `wait_for_human` でinterrupt中の場合  
-   最新issueから未取り込みjournalだけをresume payloadとして渡す。AIが過去に投稿した同一内容は重複取り込みしない。人間コメントがあれば `analyze_feedback` へ進む。
+   最新issueから未取り込みjournalだけをresume payloadとして渡す。設定済みエージェントが過去に投稿した同一内容は重複取り込みしない。人間コメントがあれば `analyze_feedback` へ進む。
 
 3. checkpointに `next` が残っている場合  
    前回プロセスが途中で止まった状態として、次ノードから継続する。差し戻し後のstep実行途中なら、再開コメントを `start` としてemitしてから続ける。

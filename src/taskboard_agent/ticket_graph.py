@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, replace
+from collections.abc import Collection
 from typing import Annotated, Any, Protocol, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
@@ -78,11 +79,13 @@ class TicketConversationGraph:
         task_orchestrator: TaskOrchestrator,
         llm: RevisionLLMPort,
         checkpointer: CheckpointerPort,
-        ai_user_id: int,
+        ai_user_ids: Collection[int],
     ) -> None:
         self._task_orchestrator = task_orchestrator
         self._llm = llm
-        self._ai_user_id = ai_user_id
+        self._ai_user_ids = frozenset(ai_user_ids)
+        if not self._ai_user_ids:
+            raise ValueError("ai_user_ids must not be empty")
         self._event_sink: SkillEventSink | None = None
 
         builder = StateGraph(TicketState)
@@ -186,7 +189,7 @@ class TicketConversationGraph:
             notes = _journal_notes(journal)
             if not notes:
                 continue
-            if _journal_user_id(journal) == self._ai_user_id:
+            if _journal_user_id(journal) in self._ai_user_ids:
                 messages.append(AIMessage(content=notes))
             else:
                 messages.append(HumanMessage(content=notes))
@@ -535,7 +538,7 @@ class TicketConversationGraph:
             notes = _journal_notes(journal)
             if not notes:
                 continue
-            if _journal_user_id(journal) == self._ai_user_id:
+            if _journal_user_id(journal) in self._ai_user_ids:
                 if notes not in existing_ai_content:
                     journal_messages.append(
                         {"role": "assistant", "content": notes}

@@ -146,6 +146,34 @@
 - dry-run、write禁止、人間承認の制御が壊れていない
 - 既存スキル実行が維持されている
 
+## Phase 6: Redmine担当者別エージェントプロフィールを追加する
+
+目的:
+
+- 複数のRedmine担当者を、それぞれ異なるモデル、接続先、資格情報、任意のsystem promptで処理する
+
+方針:
+
+- エージェント固有設定はTOMLプロフィールで管理する
+- 1つのdaemonが有効なプロフィールを設定順に1件ずつ巡回する
+- LLM設定はLiteLLM直接呼び出しとLangChain agentの両方へ適用する
+- LangGraph threadはissue単位のまま維持する
+- プロセス内並列実行とSecretVault連携は別Phaseとする
+
+完了条件:
+
+- 担当者ごとにRedmine APIキー、モデル、endpoint、LLM APIキーを切り替えられる
+- system promptファイルは任意で、未設定時も既存の共通指示だけで実行できる
+- 各巡回で有効な全プロフィールが処理機会を持つ
+- 担当者不一致の明示チケットを更新しない
+
+実装状況:
+
+- `agents.toml` から有効なプロフィールを読み、担当者別runtimeを構築する
+- `run-once --agent` が担当者一致を検証し、daemonがプロフィールを1件ずつ巡回する
+- LiteLLM直接呼び出しとChatLiteLLM agentへ同じモデル、endpoint、APIキー、任意のsystem promptを適用する
+- 設定済みの全RedmineエージェントユーザーをLangGraph会話上のAI投稿者として扱う
+
 ## 実装時の原則
 
 - 1回の変更で複数Phaseをまとめて実装しない

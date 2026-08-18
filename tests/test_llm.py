@@ -45,6 +45,56 @@ def test_litellm_client_reads_text_response(monkeypatch: pytest.MonkeyPatch) -> 
     assert response.tool_calls == ()
 
 
+def test_litellm_client_applies_profile_connection_and_system_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_messages = [
+        {"role": "system", "content": "共通規則"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    def fake_completion(**kwargs: object) -> dict[str, object]:
+        assert kwargs["model"] == "provider/test-model"
+        assert kwargs["base_url"] == "https://llm.example.test/v1"
+        assert kwargs["api_key"] == "profile-key"
+        messages = kwargs["messages"]
+        assert isinstance(messages, list)
+        assert messages[0] == {"role": "system", "content": "共通規則"}
+        assert messages[1]["role"] == "system"
+        assert "担当エージェント固有" in messages[1]["content"]
+        assert "根拠を明示する" in messages[1]["content"]
+        assert messages[2] == {"role": "user", "content": "hello"}
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr("taskboard_agent.llm.litellm.completion", fake_completion)
+
+    LiteLLMClient(
+        "provider/test-model",
+        api_base="https://llm.example.test/v1",
+        api_key="profile-key",
+        system_prompt="根拠を明示する",
+    ).complete(original_messages)
+
+    assert original_messages == [
+        {"role": "system", "content": "共通規則"},
+        {"role": "user", "content": "hello"},
+    ]
+
+
+def test_litellm_client_does_not_add_empty_profile_system_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_completion(**kwargs: object) -> dict[str, object]:
+        assert kwargs["messages"] == [{"role": "user", "content": "hello"}]
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr("taskboard_agent.llm.litellm.completion", fake_completion)
+
+    LiteLLMClient("test-model", system_prompt=None).complete(
+        [{"role": "user", "content": "hello"}]
+    )
+
+
 def test_litellm_client_logs_prompt_and_response(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

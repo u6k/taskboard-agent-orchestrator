@@ -3,21 +3,29 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from taskboard_agent.config import AppConfig
+import pytest
+
+from taskboard_agent.config import AgentProfileConfig, AppConfig
 from taskboard_agent.skill_runtime import SkillEvent, SkillExecutionResult
 from taskboard_agent.workflow import WorkflowError, run_once
 
 
+AGENT = AgentProfileConfig(
+    id="test-agent",
+    redmine_user_id=42,
+    redmine_api_key="redmine-key",
+    llm_model="test-model",
+    llm_api_key="llm-key",
+)
+
 CONFIG = AppConfig(
     redmine_url="https://redmine.example.test",
-    redmine_api_key="redmine-key",
-    redmine_ai_user_id=42,
     redmine_in_progress_status_id=2,
     redmine_review_status_id=10,
-    llm_model="test-model",
     linkace_url="https://linkace.example.test",
     linkace_api_key="linkace-key",
     linkace_summarized_list_id=10,
+    agents=(AGENT,),
 )
 
 
@@ -106,7 +114,13 @@ class FakeTaskExecutor:
 
 
 def _issue() -> dict[str, Any]:
-    return {"id": 123, "author": {"id": 7}, "subject": "test", "description": "do it"}
+    return {
+        "id": 123,
+        "author": {"id": 7},
+        "assigned_to": {"id": 42},
+        "subject": "test",
+        "description": "do it",
+    }
 
 
 def _processed_result() -> SkillExecutionResult:
@@ -142,6 +156,7 @@ def test_run_once_no_issue_does_not_execute() -> None:
 
     result = run_once(
         config=CONFIG,
+        agent=AGENT,
         redmine=redmine,
         task_executor=executor,
     )
@@ -158,6 +173,7 @@ def test_run_once_processes_explicit_issue_without_searching() -> None:
 
     result = run_once(
         config=CONFIG,
+        agent=AGENT,
         redmine=redmine,
         task_executor=executor,
         issue_id=123,
@@ -174,6 +190,7 @@ def test_run_once_applies_skill_events_to_redmine() -> None:
 
     result = run_once(
         config=CONFIG,
+        agent=AGENT,
         redmine=redmine,
         task_executor=FakeTaskExecutor(),
     )
@@ -216,6 +233,7 @@ def test_run_once_needs_user_returns_to_author_for_review() -> None:
 
     result = run_once(
         config=CONFIG,
+        agent=AGENT,
         redmine=redmine,
         task_executor=executor,
     )
@@ -245,6 +263,7 @@ def test_run_once_final_return_returns_to_author_for_review() -> None:
 
     result = run_once(
         config=CONFIG,
+        agent=AGENT,
         redmine=redmine,
         task_executor=executor,
     )
@@ -273,6 +292,7 @@ def test_run_once_can_return_to_review_without_adding_a_comment() -> None:
 
     result = run_once(
         config=CONFIG,
+        agent=AGENT,
         redmine=redmine,
         task_executor=executor,
     )
@@ -289,6 +309,7 @@ def test_run_once_dry_run_does_not_update_redmine() -> None:
 
     result = run_once(
         config=CONFIG,
+        agent=AGENT,
         redmine=redmine,
         task_executor=FakeTaskExecutor(),
         dry_run=True,
@@ -310,6 +331,7 @@ def test_run_once_executor_failure_comments_and_returns_to_author() -> None:
 
     result = run_once(
         config=CONFIG,
+        agent=AGENT,
         redmine=redmine,
         task_executor=FakeTaskExecutor(fail=True),
     )
@@ -333,6 +355,7 @@ def test_run_once_logs_progress_with_trace_id(caplog) -> None:
 
     run_once(
         config=CONFIG,
+        agent=AGENT,
         redmine=redmine,
         task_executor=FakeTaskExecutor(),
     )
@@ -346,12 +369,18 @@ def test_run_once_logs_progress_with_trace_id(caplog) -> None:
 def test_run_once_missing_author_id_fails_without_update() -> None:
     redmine = FakeRedmine(
         [{"id": 123}],
-        issue={"id": 123, "author": {"name": "requester"}, "subject": "test"},
+        issue={
+            "id": 123,
+            "author": {"name": "requester"},
+            "assigned_to": {"id": 42},
+            "subject": "test",
+        },
     )
 
     try:
         run_once(
             config=CONFIG,
+            agent=AGENT,
             redmine=redmine,
             task_executor=FakeTaskExecutor(),
         )
@@ -360,4 +389,23 @@ def test_run_once_missing_author_id_fails_without_update() -> None:
     else:
         raise AssertionError("WorkflowError was not raised")
 
+    assert redmine.updated == []
+
+
+def test_run_once_rejects_issue_assigned_to_another_agent() -> None:
+    issue = _issue()
+    issue["assigned_to"] = {"id": 99}
+    redmine = FakeRedmine([], issue)
+    executor = FakeTaskExecutor()
+
+    with pytest.raises(WorkflowError, match="assignee does not match"):
+        run_once(
+            config=CONFIG,
+            agent=AGENT,
+            redmine=redmine,
+            task_executor=executor,
+            issue_id=123,
+        )
+
+    assert executor.calls == []
     assert redmine.updated == []

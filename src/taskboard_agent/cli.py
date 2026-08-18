@@ -15,7 +15,7 @@ from langchain_litellm import ChatLiteLLM
 
 from taskboard_agent.agent import LangChainAgentRunner
 from taskboard_agent.config import AppConfig, ConfigError, load_config
-from taskboard_agent.daemon import DaemonResult, run_daemon
+from taskboard_agent.daemon import AgentExecutionContext, DaemonResult, run_daemon
 from taskboard_agent.linkace import LinkAceClient, LinkAceError
 from taskboard_agent.logging_config import configure_logging, log_trace
 from taskboard_agent.llm import LiteLLMClient
@@ -56,8 +56,7 @@ class TaskboardArgumentParser(argparse.ArgumentParser):
 @dataclass(frozen=True)
 class Runtime:
     config: AppConfig
-    redmine: RedmineClient
-    task_executor: TicketConversationGraph
+    agents: tuple[AgentExecutionContext, ...]
 
 
 def _positive_issue_id(value: str) -> int:
@@ -82,11 +81,21 @@ def _positive_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = TaskboardArgumentParser(prog="taskboard-agent")
+    parser.add_argument(
+        "--config",
+        default="agents.toml",
+        help="Agent profile TOML path. Defaults to agents.toml.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_once_parser = subparsers.add_parser(
         "run-once",
-        help="Process one open Redmine issue assigned to the AI user.",
+        help="Process one open Redmine issue for the selected agent profile.",
+    )
+    run_once_parser.add_argument(
+        "--agent",
+        required=True,
+        help="Agent profile ID to use for this run.",
     )
     run_once_parser.add_argument(
         "--dry-run",
@@ -100,13 +109,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_issue_id,
         help=(
             "Process this Redmine issue directly instead of searching for an open "
-            "issue assigned to the AI user."
+            "issue assigned to the selected agent profile."
         ),
     )
 
     run_daemon_parser = subparsers.add_parser(
         "run-daemon",
-        help="Continuously poll and process open Redmine issues assigned to the AI user.",
+        help="Continuously poll and process issues for all enabled agent profiles.",
     )
     run_daemon_parser.add_argument(
         "--dry-run",
@@ -132,39 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 @contextmanager
-def build_runtime(*, dry_run: bool) -> Iterator[Runtime]:
-    config = load_config()
-    redmine = RedmineClient(config.redmine_url, config.redmine_api_key)
-    llm = LiteLLMClient(model=config.llm_model)
-    chat_model = ChatLiteLLM(model=config.llm_model)
+def build_runtime(*, dry_run: bool, config_path: str | Path = "agents.toml") -> Iterator[Runtime]:
+    config = load_config(agents_file=config_path)
     page_fetcher = WebPageExtractor()
     search_client = DuckDuckGoSearchClient()
     bookmark_client = LinkAceClient(config.linkace_url, config.linkace_api_key)
     skill_registry = SkillRegistry(Path("skills"))
-    skill_agent = LangChainAgentRunner(model=chat_model)
-    tool_catalog = ToolScriptCatalog(
-        Path("tool_scripts"),
-        ToolRuntimeContext(
-            services={
-                "llm": llm,
-                "page_fetcher": page_fetcher,
-                "search_client": search_client,
-                "bookmark_client": bookmark_client,
-                "redmine_client": redmine,
-            },
-            settings={
-                "linkace_summarized_list_id": config.linkace_summarized_list_id,
-            },
-            dry_run=dry_run,
-        ),
-    )
-    task_orchestrator = TaskOrchestrator(
-        planner=LiteLLMTaskPlanner(llm),
-        skill_registry=skill_registry,
-        tool_catalog=tool_catalog,
-        skill_agent=skill_agent,
-        generic_runner=GenericTaskRunner(llm),
-    )
     if dry_run:
         checkpointer_context = nullcontext(InMemorySaver())
     else:
@@ -175,16 +157,71 @@ def build_runtime(*, dry_run: bool) -> Iterator[Runtime]:
             str(config.langgraph_checkpoint_db_path)
         )
     with checkpointer_context as checkpointer:
-        task_executor = TicketConversationGraph(
-            task_orchestrator=task_orchestrator,
-            llm=llm,
-            checkpointer=checkpointer,
-            ai_user_id=config.redmine_ai_user_id,
-        )
+        ai_user_ids = {agent.redmine_user_id for agent in config.agents}
+        agent_contexts: list[AgentExecutionContext] = []
+        for profile in config.agents:
+            logger.info(
+                "エージェントruntimeを構築します agent_id=%s redmine_user_id=%s model=%s api_base=%s",
+                profile.id,
+                profile.redmine_user_id,
+                profile.llm_model,
+                profile.llm_api_base,
+            )
+            redmine = RedmineClient(config.redmine_url, profile.redmine_api_key)
+            llm = LiteLLMClient(
+                model=profile.llm_model,
+                api_base=profile.llm_api_base,
+                api_key=profile.llm_api_key,
+                system_prompt=profile.system_prompt,
+            )
+            chat_model = ChatLiteLLM(
+                model=profile.llm_model,
+                api_base=profile.llm_api_base,
+                api_key=profile.llm_api_key,
+            )
+            skill_agent = LangChainAgentRunner(
+                model=chat_model,
+                system_prompt=profile.system_prompt,
+            )
+            tool_catalog = ToolScriptCatalog(
+                Path("tool_scripts"),
+                ToolRuntimeContext(
+                    services={
+                        "llm": llm,
+                        "page_fetcher": page_fetcher,
+                        "search_client": search_client,
+                        "bookmark_client": bookmark_client,
+                        "redmine_client": redmine,
+                    },
+                    settings={
+                        "linkace_summarized_list_id": config.linkace_summarized_list_id,
+                    },
+                    dry_run=dry_run,
+                ),
+            )
+            task_orchestrator = TaskOrchestrator(
+                planner=LiteLLMTaskPlanner(llm),
+                skill_registry=skill_registry,
+                tool_catalog=tool_catalog,
+                skill_agent=skill_agent,
+                generic_runner=GenericTaskRunner(llm),
+            )
+            task_executor = TicketConversationGraph(
+                task_orchestrator=task_orchestrator,
+                llm=llm,
+                checkpointer=checkpointer,
+                ai_user_ids=ai_user_ids,
+            )
+            agent_contexts.append(
+                AgentExecutionContext(
+                    profile=profile,
+                    redmine=redmine,
+                    task_executor=task_executor,
+                )
+            )
         yield Runtime(
             config=config,
-            redmine=redmine,
-            task_executor=task_executor,
+            agents=tuple(agent_contexts),
         )
 
 
@@ -201,11 +238,15 @@ def main(argv: list[str] | None = None) -> int:
                     args.command,
                     args.dry_run,
                 )
-            with build_runtime(dry_run=args.dry_run) as runtime:
+            with build_runtime(
+                dry_run=args.dry_run, config_path=args.config
+            ) as runtime:
+                agent_context = _agent_context(runtime, args.agent)
                 result = run_once(
                     config=runtime.config,
-                    redmine=runtime.redmine,
-                    task_executor=runtime.task_executor,
+                    agent=agent_context.profile,
+                    redmine=agent_context.redmine,
+                    task_executor=agent_context.task_executor,
                     dry_run=args.dry_run,
                     issue_id=args.issue_id,
                 )
@@ -220,11 +261,12 @@ def main(argv: list[str] | None = None) -> int:
                     args.interval_seconds,
                     args.max_iterations,
                 )
-            with build_runtime(dry_run=args.dry_run) as runtime:
+            with build_runtime(
+                dry_run=args.dry_run, config_path=args.config
+            ) as runtime:
                 daemon_result = run_daemon(
                     config=runtime.config,
-                    redmine=runtime.redmine,
-                    task_executor=runtime.task_executor,
+                    agents=runtime.agents,
                     dry_run=args.dry_run,
                     interval_seconds=args.interval_seconds,
                     max_iterations=args.max_iterations,
@@ -254,7 +296,7 @@ def _print_run_once_result(result: RunResult) -> int:
     if result.status == "no_issue":
         with log_trace("run-once"):
             logger.info("CLIを終了します status=no_issue")
-        print("No open Redmine issues are assigned to the AI user.")
+        print(f"No open Redmine issues are assigned to agent {result.agent_id}.")
         return 0
 
     if result.dry_run:
@@ -292,7 +334,7 @@ def _print_run_once_result(result: RunResult) -> int:
         )
     print(
         "Processed issue "
-        f"#{result.issue_id}; status={result.status}; "
+        f"#{result.issue_id}; agent={result.agent_id}; status={result.status}; "
         f"reassigned to author #{result.reassigned_to_id}."
     )
     return 0
@@ -305,6 +347,16 @@ def _print_daemon_result(result: DaemonResult) -> None:
         f"processed={result.processed}; "
         f"no_issue={result.no_issue}; "
         f"stopped_by_signal={result.stopped_by_signal}."
+    )
+
+
+def _agent_context(runtime: Runtime, agent_id: str) -> AgentExecutionContext:
+    for context in runtime.agents:
+        if context.profile.id == agent_id:
+            return context
+    available = ", ".join(context.profile.id for context in runtime.agents)
+    raise ConfigError(
+        f"unknown agent profile: {agent_id}; available profiles: {available}"
     )
 
 

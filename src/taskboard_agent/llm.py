@@ -34,12 +34,26 @@ class LLMResponse:
 
 
 class LiteLLMClient:
-    def __init__(self, model: str) -> None:
+    def __init__(
+        self,
+        model: str,
+        *,
+        api_base: str | None = None,
+        api_key: str | None = None,
+        system_prompt: str | None = None,
+    ) -> None:
         self._model = model
+        self._api_base = api_base
+        self._api_key = api_key
+        self._system_prompt = system_prompt.strip() if system_prompt else None
 
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def api_base(self) -> str | None:
+        return self._api_base
 
     def supports_function_calling(self) -> bool:
         try:
@@ -57,8 +71,12 @@ class LiteLLMClient:
     ) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": self._model,
-            "messages": messages,
+            "messages": with_agent_system_prompt(messages, self._system_prompt),
         }
+        if self._api_base is not None:
+            kwargs["base_url"] = self._api_base
+        if self._api_key is not None:
+            kwargs["api_key"] = self._api_key
         if tools is not None:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
@@ -71,7 +89,7 @@ class LiteLLMClient:
             self._model,
             _log_json(
                 {
-                    "messages": messages,
+                    "messages": kwargs["messages"],
                     "tools": tools,
                     "tool_choice": tool_choice if tools is not None else None,
                     "response_format": response_format,
@@ -101,6 +119,29 @@ class LiteLLMClient:
             ),
         )
         return llm_response
+
+
+def with_agent_system_prompt(
+    messages: list[dict[str, Any]],
+    system_prompt: str | None,
+) -> list[dict[str, Any]]:
+    copied = [dict(message) for message in messages]
+    if system_prompt is None or not system_prompt.strip():
+        return copied
+    agent_message = {
+        "role": "system",
+        "content": (
+            "以下は担当エージェント固有の補助指示です。"
+            "共通の業務制御、出力形式、tool policy、dry-run、承認規則と矛盾する場合は、"
+            "共通規則を優先してください。\n\n"
+            f"{system_prompt.strip()}"
+        ),
+    }
+    insert_at = 0
+    while insert_at < len(copied) and copied[insert_at].get("role") == "system":
+        insert_at += 1
+    copied.insert(insert_at, agent_message)
+    return copied
 
 
 class LiteLLMDescriptionGenerator:

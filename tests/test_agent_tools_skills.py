@@ -19,6 +19,7 @@ from taskboard_agent.tools import ToolExecutionError, execute_tool
 class FakeChatModel(BaseChatModel):
     responses: list[AIMessage] = Field(default_factory=list)
     calls: int = 0
+    seen_messages: list[list[BaseMessage]] = Field(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
@@ -36,6 +37,7 @@ class FakeChatModel(BaseChatModel):
     ) -> ChatResult:
         del stop, run_manager, kwargs
         self.calls += 1
+        self.seen_messages.append(messages)
         return ChatResult(generations=[ChatGeneration(message=self.responses.pop(0))])
 
 
@@ -129,6 +131,31 @@ def test_langchain_agent_runner_executes_tool_calls_until_final_response() -> No
     assert result.stopped_reason == "final"
     assert result.tool_results[0].content == {"text": "hello"}
     assert model.calls == 2
+
+
+def test_langchain_agent_runner_applies_profile_system_prompt() -> None:
+    @tool
+    def echo(text: str) -> dict[str, Any]:
+        """Echo text."""
+        return {"text": text}
+
+    model = FakeChatModel(responses=[AIMessage(content="done")])
+
+    LangChainAgentRunner(
+        model=model,
+        system_prompt="簡潔な日本語で回答する",
+    ).run(
+        [
+            {"role": "system", "content": "共通規則"},
+            {"role": "user", "content": "echo hello"},
+        ],
+        tools=[echo],
+    )
+
+    first_call = model.seen_messages[0]
+    assert first_call[0].content == "共通規則"
+    assert "担当エージェント固有" in str(first_call[1].content)
+    assert "簡潔な日本語で回答する" in str(first_call[1].content)
 
 
 def test_langchain_agent_runner_can_return_after_tool() -> None:
