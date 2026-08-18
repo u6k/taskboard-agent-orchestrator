@@ -21,6 +21,7 @@ class AgentProfileConfig:
     llm_model: str
     llm_api_key: str = field(repr=False)
     llm_api_base: str | None = None
+    llm_timeout_seconds: int | None = None
     system_prompt: str | None = field(default=None, repr=False)
     system_prompt_file: Path | None = None
 
@@ -130,6 +131,11 @@ def _parse_agent_profile(
         allow_empty=True,
     )
     llm_api_base = _optional_profile_string(raw, "llm_api_base", index=index)
+    llm_timeout_seconds = _optional_positive_profile_int(
+        raw,
+        "llm_timeout_seconds",
+        index=index,
+    )
 
     prompt_value = raw.get("system_prompt_file")
     system_prompt_file: Path | None = None
@@ -166,6 +172,7 @@ def _parse_agent_profile(
         llm_model=llm_model,
         llm_api_base=llm_api_base,
         llm_api_key=llm_api_key,
+        llm_timeout_seconds=llm_timeout_seconds,
         system_prompt=system_prompt,
         system_prompt_file=system_prompt_file,
     )
@@ -210,6 +217,20 @@ def _required_profile_int(
     value = raw.get(name)
     if not isinstance(value, int) or isinstance(value, bool):
         raise ConfigError(f"agents[{index}].{name} must be an integer")
+    return value
+
+
+def _optional_positive_profile_int(
+    raw: dict[str, Any],
+    name: str,
+    *,
+    index: int,
+) -> int | None:
+    value = raw.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ConfigError(f"agents[{index}].{name} must be a positive integer")
     return value
 
 

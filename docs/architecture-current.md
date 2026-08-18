@@ -29,7 +29,7 @@ CLI
 
 `taskboard-agent run-once` と `taskboard-agent run-daemon` のエントリポイントである。
 
-- `.env` から共有設定、TOMLから担当者別エージェントプロフィールを読む
+- `.env` から共有設定、TOMLから担当者別の接続先、資格情報、LLMタイムアウトを含むエージェントプロフィールを読む
 - プロフィールごとに `RedmineClient`, `LiteLLMClient`, `ChatLiteLLM`, `ToolScriptCatalog`, `TaskOrchestrator`, `TicketConversationGraph` を組み立てる
 - `--dry-run` では `InMemorySaver` を使う
 - 通常実行ではSQLite Checkpointerを使う

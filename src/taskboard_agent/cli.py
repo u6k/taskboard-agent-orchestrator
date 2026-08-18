@@ -161,23 +161,27 @@ def build_runtime(*, dry_run: bool, config_path: str | Path = "agents.toml") -> 
         agent_contexts: list[AgentExecutionContext] = []
         for profile in config.agents:
             logger.info(
-                "エージェントruntimeを構築します agent_id=%s redmine_user_id=%s model=%s api_base=%s",
+                "エージェントruntimeを構築します agent_id=%s "
+                "redmine_user_id=%s model=%s api_base=%s timeout_seconds=%s",
                 profile.id,
                 profile.redmine_user_id,
                 profile.llm_model,
                 profile.llm_api_base,
+                profile.llm_timeout_seconds,
             )
             redmine = RedmineClient(config.redmine_url, profile.redmine_api_key)
             llm = LiteLLMClient(
                 model=profile.llm_model,
                 api_base=profile.llm_api_base,
                 api_key=profile.llm_api_key,
+                timeout_seconds=profile.llm_timeout_seconds,
                 system_prompt=profile.system_prompt,
             )
             chat_model = ChatLiteLLM(
                 model=profile.llm_model,
                 api_base=profile.llm_api_base,
                 api_key=profile.llm_api_key,
+                request_timeout=profile.llm_timeout_seconds,
             )
             skill_agent = LangChainAgentRunner(
                 model=chat_model,

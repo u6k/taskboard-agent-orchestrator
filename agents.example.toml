@@ -8,6 +8,7 @@ redmine_api_key = "replace-with-redmine-api-key"
 llm_model = "openai/gpt-4.1-mini"
 llm_api_base = "https://api.openai.com/v1"
 llm_api_key = "replace-with-llm-api-key"
+llm_timeout_seconds = 600
 system_prompt_file = "agent-prompts/research-agent.md"
 
 [[agents]]
@@ -18,3 +19,4 @@ redmine_api_key = "replace-with-redmine-api-key"
 llm_model = "lm_studio/replace-with-lm-studio-model-id"
 llm_api_base = "http://localhost:1234/v1"
 llm_api_key = ""
+llm_timeout_seconds = 1200
