@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import inspect
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import litellm
+from langchain_core.callbacks import BaseCallbackHandler
+
+from taskboard_agent.logging_config import current_trace_id
 
 
 logger = logging.getLogger(__name__)
@@ -74,6 +79,7 @@ class LiteLLMClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = "auto",
         response_format: dict[str, Any] | None = None,
+        operation: str = "completion",
     ) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -92,41 +98,60 @@ class LiteLLMClient:
             kwargs["response_format"] = response_format
             if response_format.get("type") == "json_schema":
                 kwargs["enable_json_schema_validation"] = True
-        logger.debug(
-            "LLM入力プロンプト model=%s payload=%s",
-            self._model,
-            _log_json(
-                {
-                    "messages": kwargs["messages"],
-                    "tools": tools,
-                    "tool_choice": tool_choice if tools is not None else None,
-                    "response_format": response_format,
-                }
-            ),
+        metrics = _input_metrics(
+            model=self._model,
+            messages=kwargs["messages"],
+            tools=tools,
         )
+        started = time.perf_counter()
         try:
             response = litellm.completion(**kwargs)
         except Exception as exc:  # pragma: no cover - provider exceptions vary.
+            _log_llm_metrics(
+                operation=operation,
+                model=self._model,
+                request_id=None,
+                input_metrics=metrics,
+                duration_seconds=time.perf_counter() - started,
+                output_chars=0,
+                success=False,
+                exception_type=type(exc).__name__,
+            )
             raise LLMError(f"failed to call language model: {exc}") from exc
         llm_response = _to_llm_response(response)
-        logger.debug(
-            "LLM出力内容 model=%s payload=%s",
-            self._model,
-            _log_json(
-                {
-                    "content": llm_response.content,
-                    "tool_calls": [
-                        {
-                            "id": tool_call.id,
-                            "name": tool_call.name,
-                            "arguments": tool_call.arguments,
-                        }
-                        for tool_call in llm_response.tool_calls
-                    ],
-                }
-            ),
+        _log_llm_metrics(
+            operation=operation,
+            model=self._model,
+            request_id=_response_request_id(response),
+            input_metrics=metrics,
+            duration_seconds=time.perf_counter() - started,
+            output_chars=len(llm_response.content),
+            success=True,
+            exception_type=None,
         )
         return llm_response
+
+
+def complete_with_operation(
+    client: Any,
+    messages: list[dict[str, Any]],
+    *,
+    operation: str,
+    **kwargs: Any,
+) -> Any:
+    """Passes operation to instrumented clients while keeping simple test ports usable."""
+    try:
+        parameters = inspect.signature(client.complete).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    supports_operation = any(
+        parameter.name == "operation"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if supports_operation:
+        return client.complete(messages, operation=operation, **kwargs)
+    return client.complete(messages, **kwargs)
 
 
 def with_agent_system_prompt(
@@ -171,7 +196,8 @@ class LiteLLMDescriptionGenerator:
                         ),
                     },
                     {"role": "user", "content": prompt},
-                ]
+                ],
+                operation="structured_final",
             )
         except Exception as exc:  # pragma: no cover - SDK exceptions vary by version.
             raise CommentGenerationError(f"failed to generate comment: {exc}") from exc
@@ -284,5 +310,134 @@ def _get(value: Any, key: str, default: Any = None) -> Any:
     return getattr(value, key, default)
 
 
-def _log_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str)
+def _input_metrics(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> dict[str, int]:
+    serialized = json.dumps(messages, ensure_ascii=False, default=str)
+    try:
+        estimated_tokens = litellm.token_counter(model=model, messages=messages)
+        if not isinstance(estimated_tokens, int) or estimated_tokens < 0:
+            raise ValueError("invalid token count")
+    except Exception:
+        estimated_tokens = max(1, len(serialized) // 4)
+    return {
+        "message_count": len(messages),
+        "input_chars": len(serialized),
+        "input_bytes": len(serialized.encode("utf-8")),
+        "estimated_tokens": estimated_tokens,
+        "tool_count": len(tools or []),
+    }
+
+
+def _log_llm_metrics(
+    *,
+    operation: str,
+    model: str,
+    request_id: str | None,
+    input_metrics: dict[str, int],
+    duration_seconds: float,
+    output_chars: int,
+    success: bool,
+    exception_type: str | None,
+) -> None:
+    payload: dict[str, Any] = {
+        "event": "llm_call",
+        "trace_id": current_trace_id(),
+        "operation": operation,
+        "model": model,
+        "request_id": request_id,
+        **input_metrics,
+        "duration_seconds": round(duration_seconds, 6),
+        "output_chars": output_chars,
+        "success": success,
+        "exception_type": exception_type,
+    }
+    logger.info(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _response_request_id(response: Any) -> str | None:
+    value = _get(response, "id")
+    return str(value) if value else None
+
+
+class LLMCallMetricsCallback(BaseCallbackHandler):
+    """Logs LangChain chat model calls without recording message bodies."""
+
+    def __init__(self, *, model: str, operation: str, tool_count: int = 0) -> None:
+        self._model = model
+        self._operation = operation
+        self._tool_count = tool_count
+        self._runs: dict[str, tuple[float, dict[str, int]]] = {}
+
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[Any]],
+        *,
+        run_id: Any,
+        **kwargs: Any,
+    ) -> None:
+        flattened = messages[0] if messages else []
+        message_dicts = [
+            {
+                "role": getattr(message, "type", "message"),
+                "content": getattr(message, "content", ""),
+            }
+            for message in flattened
+        ]
+        metrics = _input_metrics(model=self._model, messages=message_dicts, tools=None)
+        metrics["tool_count"] = self._tool_count
+        self._runs[str(run_id)] = (
+            time.perf_counter(),
+            metrics,
+        )
+
+    def on_llm_end(self, response: Any, *, run_id: Any, **kwargs: Any) -> None:
+        started, metrics = self._runs.pop(
+            str(run_id), (time.perf_counter(), _empty_input_metrics())
+        )
+        output_chars = 0
+        for generation_group in getattr(response, "generations", []) or []:
+            for generation in generation_group or []:
+                text = getattr(generation, "text", "") or ""
+                message = getattr(generation, "message", None)
+                content = getattr(message, "content", "") if message is not None else ""
+                output_chars += len(str(content or text))
+        _log_llm_metrics(
+            operation=self._operation,
+            model=self._model,
+            request_id=str(run_id),
+            input_metrics=metrics,
+            duration_seconds=time.perf_counter() - started,
+            output_chars=output_chars,
+            success=True,
+            exception_type=None,
+        )
+
+    def on_llm_error(self, error: BaseException, *, run_id: Any, **kwargs: Any) -> None:
+        started, metrics = self._runs.pop(
+            str(run_id), (time.perf_counter(), _empty_input_metrics())
+        )
+        _log_llm_metrics(
+            operation=self._operation,
+            model=self._model,
+            request_id=str(run_id),
+            input_metrics=metrics,
+            duration_seconds=time.perf_counter() - started,
+            output_chars=0,
+            success=False,
+            exception_type=type(error).__name__,
+        )
+
+
+def _empty_input_metrics() -> dict[str, int]:
+    return {
+        "message_count": 0,
+        "input_chars": 0,
+        "input_bytes": 0,
+        "estimated_tokens": 0,
+        "tool_count": 0,
+    }

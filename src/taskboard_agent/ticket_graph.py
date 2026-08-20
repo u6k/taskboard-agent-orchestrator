@@ -3,14 +3,23 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, replace
 from collections.abc import Collection
-from typing import Annotated, Any, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langgraph.graph import START, StateGraph
-from langgraph.graph.message import add_messages
 from langgraph.types import Command, interrupt
 
 from taskboard_agent.skill_runtime import SkillEvent, SkillEventSink, SkillExecutionResult
+from taskboard_agent.llm import complete_with_operation
+from taskboard_agent.artifacts import ArtifactRef, ArtifactStore, InMemoryArtifactStore
+from taskboard_agent.context_engine import (
+    ContextEngine,
+    ContextEngineError,
+    ContextLimitExceeded,
+    ConversationTurn,
+    SessionCheckpoint,
+    WorkingMemory,
+)
 from taskboard_agent.structured_output import revision_plan_response_format
 from taskboard_agent.task_executor import (
     MAX_TASK_PLAN_ATTEMPTS,
@@ -18,8 +27,10 @@ from taskboard_agent.task_executor import (
     TaskPlan,
     TaskPlanningError,
     TaskStep,
+    TaskStepExecution,
     normalize_task_plan_names,
     parse_task_plan,
+    validate_task_plan,
 )
 
 
@@ -45,7 +56,12 @@ class TicketState(TypedDict, total=False):
     issue: dict[str, Any]
     initialized: bool
     dry_run: bool
-    messages: Annotated[list[AnyMessage], add_messages]
+    messages: list[AnyMessage]
+    working_memory: dict[str, Any]
+    session_checkpoint: dict[str, Any]
+    recent_turns: list[dict[str, Any]]
+    active_artifacts: dict[str, dict[str, Any]]
+    artifact_refs: list[dict[str, Any]]
     last_ingested_journal_id: int
     has_human_feedback: bool
     current_plan: dict[str, Any] | None
@@ -70,6 +86,9 @@ class RevisionPlan(TypedDict):
     task_plan: dict[str, Any]
 
 
+MAX_INLINE_ASSISTANT_TURN_CHARS = 12_000
+
+
 class TicketConversationGraph:
     """Runs one durable LangGraph conversation for each Redmine issue."""
 
@@ -80,10 +99,18 @@ class TicketConversationGraph:
         llm: RevisionLLMPort,
         checkpointer: CheckpointerPort,
         ai_user_ids: Collection[int],
+        context_engine: ContextEngine | None = None,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self._task_orchestrator = task_orchestrator
         self._llm = llm
         self._ai_user_ids = frozenset(ai_user_ids)
+        self._artifact_store = artifact_store or InMemoryArtifactStore()
+        self._context_engine = context_engine or ContextEngine(
+            llm=llm,
+            artifact_store=self._artifact_store,
+            context_window_tokens=131072,
+        )
         if not self._ai_user_ids:
             raise ValueError("ai_user_ids must not be empty")
         self._event_sink: SkillEventSink | None = None
@@ -182,23 +209,24 @@ class TicketConversationGraph:
 
     def _initialize(self, state: TicketState) -> dict[str, Any]:
         issue = state["issue"]
-        messages: list[AnyMessage] = [
-            HumanMessage(content=_initial_issue_message(issue))
-        ]
-        for journal in _journals(issue):
-            notes = _journal_notes(journal)
-            if not notes:
-                continue
-            if _journal_user_id(journal) in self._ai_user_ids:
-                messages.append(AIMessage(content=notes))
-            else:
-                messages.append(HumanMessage(content=notes))
+        turns = _initial_conversation_turns(issue, self._ai_user_ids)
+        turns, initial_refs, initial_active = self._persist_initial_assistant_turns(
+            turns
+        )
+        issue_without_journals = _without_journals(issue)
         return {
             "issue_id": _require_issue_id(issue),
-            "issue": _without_journals(issue),
+            "issue": issue_without_journals,
             "initialized": True,
             "dry_run": bool(state.get("dry_run", False)),
-            "messages": messages,
+            "messages": [],
+            "working_memory": WorkingMemory(
+                issue=_working_issue(issue_without_journals)
+            ).to_dict(),
+            "session_checkpoint": SessionCheckpoint().to_dict(),
+            "recent_turns": [turn.to_dict() for turn in turns],
+            "active_artifacts": initial_active,
+            "artifact_refs": [ref.to_dict() for ref in initial_refs],
             "last_ingested_journal_id": _max_journal_id(issue),
             "plan_steps": [],
             "current_step_index": None,
@@ -212,14 +240,54 @@ class TicketConversationGraph:
         }
 
     def _initial_plan(self, state: TicketState) -> dict[str, Any]:
-        plan = _ensure_executable_steps(self._task_orchestrator.create_plan(state["issue"]))
-        return {"current_plan": _task_plan_dict(plan)} | _planned_step_state(plan)
+        try:
+            prepared = self._prepare_context(state)
+            artifact_ids = tuple(
+                ref.artifact_id for ref in self._refs_for_state(state)
+            )
+            plan = _ensure_executable_steps(
+                self._task_orchestrator.create_plan(
+                    state["issue"],
+                    context_messages=list(prepared.messages),
+                    artifact_ids=artifact_ids,
+                )
+            )
+            planned = _planned_step_state(plan)
+            plan_dict = _task_plan_dict(plan)
+            return {
+                "current_plan": plan_dict,
+                "session_checkpoint": prepared.checkpoint.to_dict(),
+                "recent_turns": [turn.to_dict() for turn in prepared.recent_turns],
+                "artifact_refs": [ref.to_dict() for ref in self._refs_for_state(state)],
+                "artifacts": [ref.to_dict() for ref in self._refs_for_state(state)],
+                "working_memory": WorkingMemory(
+                    issue=_working_issue(state["issue"]),
+                    current_plan=plan_dict,
+                    plan_steps=tuple(planned["plan_steps"]),
+                    run_status="planned",
+                    active_artifacts=dict(state.get("active_artifacts", {})),
+                ).to_dict(),
+            } | planned
+        except ContextEngineError as exc:
+            plan = _context_error_plan(exc)
+            planned = _planned_step_state(plan)
+            plan_dict = _task_plan_dict(plan)
+            return {
+                "current_plan": plan_dict,
+                "working_memory": WorkingMemory(
+                    issue=_working_issue(state["issue"]),
+                    current_plan=plan_dict,
+                    plan_steps=tuple(planned["plan_steps"]),
+                    run_status="planned",
+                    active_artifacts=dict(state.get("active_artifacts", {})),
+                ).to_dict(),
+            } | planned
 
     def _publish_initial_plan(self, state: TicketState) -> dict[str, Any]:
         plan = _task_plan_from_dict(state["current_plan"])
         notes = f"{self._task_orchestrator.plan_notes(plan)}\n\n作業を開始します。"
         self._emit(SkillEvent("start", notes))
-        return {"messages": [AIMessage(content=notes)]}
+        return {}
 
     def _wait_for_human(self, state: TicketState) -> dict[str, Any]:
         payload = interrupt(
@@ -231,33 +299,39 @@ class TicketConversationGraph:
         if not isinstance(payload, dict):
             raise TaskPlanningError("ticket resume payload must be an object")
         journal_messages = payload.get("journal_messages", [])
-        messages: list[AnyMessage] = []
         human_comments: list[str] = []
+        human_journal_ids: list[int] = []
         for item in journal_messages:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 continue
             content = item["content"].strip()
             if not content:
                 continue
-            if item.get("role") == "assistant":
-                messages.append(AIMessage(content=content))
-            else:
+            if item.get("role") != "assistant":
                 human_comments.append(content)
+                journal_id = item.get("journal_id")
+                if isinstance(journal_id, int):
+                    human_journal_ids.append(journal_id)
+        recent_turns = _conversation_turns(state)
         if human_comments:
             joined_comments = "\n\n".join(human_comments)
-            messages.append(
-                HumanMessage(
-                    content=(
-                        "このチケットは人間からAIエージェントへ差し戻されました。\n\n"
-                        "人間の追加コメント:\n"
-                        f"{joined_comments}\n\n"
-                        "これまでの会話コンテキストを踏まえて、改めて作業を計画してください。"
-                    )
+            recent_turns.append(
+                ConversationTurn(
+                    id=(
+                        f"journal-{max(human_journal_ids)}"
+                        if human_journal_ids
+                        else f"resume-{len(recent_turns) + 1}"
+                    ),
+                    role="user",
+                    content=joined_comments,
+                    journal_ids=tuple(human_journal_ids),
                 )
             )
+        updated_issue = payload.get("issue", state["issue"])
         return {
-            "issue": payload.get("issue", state["issue"]),
-            "messages": messages,
+            "issue": updated_issue,
+            "recent_turns": [turn.to_dict() for turn in recent_turns],
+            "working_memory": _working_memory(state, issue=updated_issue).to_dict(),
             "last_ingested_journal_id": int(
                 payload.get(
                     "last_ingested_journal_id",
@@ -266,6 +340,7 @@ class TicketConversationGraph:
             ),
             "has_human_feedback": bool(human_comments),
             "feedback_analysis": None,
+            "messages": [],
         }
 
     @staticmethod
@@ -287,17 +362,45 @@ class TicketConversationGraph:
                 for tool in revision_tools
                 if isinstance((name := tool.get("name")), str)
             ),
+            artifact_ids=(ref.artifact_id for ref in self._refs_for_state(state)),
         )
+        try:
+            prepared = self._prepare_context(state)
+        except ContextEngineError as exc:
+            plan = _context_error_plan(exc)
+            planned = _planned_step_state(plan)
+            plan_dict = _task_plan_dict(plan)
+            analysis = {
+                "previous_work_summary": "context組み立てに失敗しました。",
+                "feedback_summary": str(exc),
+                "requested_changes": [],
+                "keep_existing_results": [],
+                "work_to_redo": [],
+                "task_plan": plan_dict,
+            }
+            return {
+                "feedback_analysis": analysis,
+                "current_plan": plan_dict,
+                "working_memory": WorkingMemory(
+                    issue=_working_issue(state["issue"]),
+                    current_plan=plan_dict,
+                    plan_steps=tuple(planned["plan_steps"]),
+                    run_status="planned",
+                    active_artifacts=dict(state.get("active_artifacts", {})),
+                ).to_dict(),
+            } | planned
         for attempt in range(MAX_TASK_PLAN_ATTEMPTS):
-            response = self._llm.complete(
+            response = complete_with_operation(
+                self._llm,
                 _revision_messages(
-                    state,
+                    context_messages=list(prepared.messages),
                     skills=skill_summaries,
                     tools=revision_tools,
                     previous_response=response_text if attempt else None,
                     previous_error=str(last_error) if last_error else None,
                 ),
                 response_format=response_format,
+                operation="revision_plan",
             )
             response_text = response.content
             try:
@@ -310,13 +413,38 @@ class TicketConversationGraph:
                     )
                 )
                 plan = normalize_task_plan_names(plan, skills=skills, tools=revision_tools)
+                validate_task_plan(
+                    plan,
+                    skills=skills,
+                    tools=revision_tools,
+                    artifact_ids={ref.artifact_id for ref in self._refs_for_state(state)},
+                )
                 plan = _ensure_executable_steps(plan)
                 normalized_revision = dict(revision)
-                normalized_revision["task_plan"] = _task_plan_dict(plan)
+                plan_dict = _task_plan_dict(plan)
+                planned = _planned_step_state(plan)
+                normalized_revision["task_plan"] = plan_dict
                 return {
                     "feedback_analysis": normalized_revision,
-                    "current_plan": _task_plan_dict(plan),
-                } | _planned_step_state(plan)
+                    "current_plan": plan_dict,
+                    "session_checkpoint": prepared.checkpoint.to_dict(),
+                    "recent_turns": [
+                        turn.to_dict() for turn in prepared.recent_turns
+                    ],
+                    "artifact_refs": [
+                        ref.to_dict() for ref in self._refs_for_state(state)
+                    ],
+                    "artifacts": [
+                        ref.to_dict() for ref in self._refs_for_state(state)
+                    ],
+                    "working_memory": WorkingMemory(
+                        issue=_working_issue(state["issue"]),
+                        current_plan=plan_dict,
+                        plan_steps=tuple(planned["plan_steps"]),
+                        run_status="planned",
+                        active_artifacts=dict(state.get("active_artifacts", {})),
+                    ).to_dict(),
+                } | planned
             except (TaskPlanningError, ValueError, TypeError, KeyError) as exc:
                 last_error = exc
         raise TaskPlanningError(
@@ -329,7 +457,7 @@ class TicketConversationGraph:
             raise TaskPlanningError("revision feedback analysis is missing")
         notes = _format_revision_comment(analysis)
         self._emit(SkillEvent("start", notes))
-        return {"messages": [AIMessage(content=notes)]}
+        return {}
 
     def _select_next_step(self, state: TicketState) -> dict[str, Any]:
         plan_steps = list(state.get("plan_steps", []))
@@ -341,7 +469,6 @@ class TicketConversationGraph:
                 started_event = _step_started_event(updated_step)
                 self._emit(started_event)
                 return {
-                    "messages": [AIMessage(content=started_event.notes or "")],
                     "plan_steps": plan_steps,
                     "current_step_index": index,
                     "run_status": "running",
@@ -361,85 +488,122 @@ class TicketConversationGraph:
             raise TaskPlanningError("current step index is out of range")
 
         issue = dict(state["issue"])
-        conversation_messages = _execution_conversation_messages(state)
-        if conversation_messages:
-            issue["conversation_context"] = conversation_messages
-
-        step_context = dict(state.get("step_context", {}))
-        context_messages = step_context.get("messages")
-        if not isinstance(context_messages, list):
-            context_messages = self._task_orchestrator.step_context_messages(
-                issue=issue,
-                conversation_messages=conversation_messages,
+        step = plan.steps[current_step_index]
+        try:
+            selected_artifact_ids = _selected_step_artifact_ids(
+                state, step=step, step_index=current_step_index
             )
+            prepared = self._prepare_context(
+                state, selected_artifact_ids=selected_artifact_ids
+            )
+            issue["selected_artifacts"] = [
+                {
+                    "artifact_id": artifact_id,
+                    "content": self._artifact_store.get(artifact_id),
+                }
+                for artifact_id in selected_artifact_ids
+            ]
+            execution = self._task_orchestrator.execute_single_step(
+                issue=issue,
+                plan=plan,
+                step=step,
+                step_index=current_step_index + 1,
+                dry_run=bool(state.get("dry_run", False)),
+                step_context=list(prepared.messages),
+            )
+        except ContextEngineError as exc:
+            result = SkillExecutionResult(
+                status="needs_user",
+                events=(SkillEvent("final_review", _context_error_notes(exc)),),
+                assistant_turn_text=_context_error_notes(exc),
+                dry_run=bool(state.get("dry_run", False)),
+            )
+            execution = TaskStepExecution(
+                index=current_step_index + 1,
+                step=step,
+                result=result,
+                events=result.events,
+                terminal_status="needs_user",
+            )
+            prepared = None
 
-        execution = self._task_orchestrator.execute_single_step(
-            issue=issue,
-            plan=plan,
-            step=plan.steps[current_step_index],
-            step_index=current_step_index + 1,
-            dry_run=bool(state.get("dry_run", False)),
-            step_context=context_messages,
+        result_refs, active_artifacts = self._persist_step_artifacts(
+            state,
+            execution.result,
+            step=step,
+            step_index=current_step_index,
         )
-
-        result_artifacts = _result_artifacts(execution.result)
-        updated_context_messages = [*context_messages, *execution.context_messages]
-        step_context["messages"] = updated_context_messages
+        execution_result = replace(
+            execution.result,
+            artifacts=tuple(ref.to_dict() for ref in result_refs),
+        )
+        step_context = dict(state.get("step_context", {}))
         step_context["last_step_status"] = execution.result.status
         if execution.terminal_status:
             step_context["terminal_status"] = execution.terminal_status
 
-        messages: list[AnyMessage] = []
         for event in execution.events:
             recorded = _step_event_for_redmine(
                 event,
                 terminal=execution.should_stop,
             )
-            if recorded.notes:
-                messages.append(AIMessage(content=recorded.notes))
             self._emit(recorded)
-        messages.extend(
-            AIMessage(content=message["content"])
-            for message in execution.context_messages
-            if isinstance(message.get("content"), str)
-        )
         artifacts = list(state.get("artifacts", []))
-        artifacts.extend(result_artifacts)
+        artifacts.extend(ref.to_dict() for ref in result_refs)
 
         plan_steps = _record_executed_step(
             state.get("plan_steps", []),
             index=current_step_index,
-            result=execution.result,
-            artifacts=result_artifacts,
+            result=execution_result,
+            artifacts=[ref.to_dict() for ref in result_refs],
         )
         step_status_event = _step_status_event(
             step=plan_steps[current_step_index],
             status=execution.result.status,
         )
-        if step_status_event.notes:
-            messages.append(AIMessage(content=step_status_event.notes))
         self._emit(step_status_event)
         step_results = list(state.get("step_results", []))
         step_results.append(
             {
                 "step_id": plan_steps[current_step_index].get("id"),
                 "index": current_step_index,
-                "status": execution.result.status,
-                "result": _execution_result_dict(execution.result),
+                "status": execution_result.status,
+                "result": _execution_result_dict(execution_result),
                 "events": [_skill_event_dict(event) for event in execution.events],
-                "artifacts": result_artifacts,
+                "artifacts": [ref.to_dict() for ref in result_refs],
             }
         )
+        run_status = execution.result.status
         return {
-            "messages": messages,
             "artifacts": artifacts,
+            "artifact_refs": [ref.to_dict() for ref in _artifact_refs(state)]
+            + [ref.to_dict() for ref in result_refs],
+            "active_artifacts": active_artifacts,
             "plan_steps": plan_steps,
             "current_step_index": (
                 current_step_index if execution.should_stop else None
             ),
             "step_results": step_results,
-            "run_status": execution.result.status,
+            "run_status": run_status,
             "step_context": step_context,
+            "working_memory": WorkingMemory(
+                issue=_working_issue(issue),
+                current_plan=_task_plan_dict(plan),
+                plan_steps=tuple(plan_steps),
+                run_status=run_status,
+                waiting_reason=(run_status if execution.should_stop else None),
+                active_artifacts=active_artifacts,
+            ).to_dict(),
+            **(
+                {
+                    "session_checkpoint": prepared.checkpoint.to_dict(),
+                    "recent_turns": [
+                        turn.to_dict() for turn in prepared.recent_turns
+                    ],
+                }
+                if prepared is not None
+                else {}
+            ),
         }
 
     @staticmethod
@@ -448,21 +612,163 @@ class TicketConversationGraph:
             return False
         return _next_pending_step_index(state.get("plan_steps", [])) is not None
 
+    def _prepare_context(
+        self,
+        state: TicketState,
+        *,
+        selected_artifact_ids: tuple[str, ...] = (),
+    ) -> Any:
+        refs = self._refs_for_state(state)
+        return self._context_engine.prepare(
+            working_memory=_working_memory(state),
+            checkpoint=SessionCheckpoint.from_dict(state.get("session_checkpoint")),
+            recent_turns=self._turns_for_state(state),
+            artifact_refs=refs,
+            selected_artifact_ids=selected_artifact_ids,
+        )
+
+    def _refs_for_state(self, state: TicketState) -> list[ArtifactRef]:
+        refs = _artifact_refs(state)
+        known = {ref.artifact_id for ref in refs}
+        for index, value in enumerate(state.get("artifacts", []), 1):
+            if not isinstance(value, dict) or "artifact_id" in value:
+                continue
+            ref = self._artifact_store.put(
+                value,
+                kind="legacy_artifact",
+                source_step_id=f"legacy-{index}",
+                label=f"legacy-artifact-{index}",
+            )
+            if ref.artifact_id not in known:
+                refs.append(ref)
+                known.add(ref.artifact_id)
+        for turn in _conversation_turns(state):
+            if turn.role != "assistant" or len(turn.content) <= MAX_INLINE_ASSISTANT_TURN_CHARS:
+                continue
+            ref = self._artifact_store.put(
+                {"text": turn.content},
+                kind="assistant_turn",
+                source_turn_id=turn.id,
+                label="legacy-assistant-answer",
+            )
+            if ref.artifact_id not in known:
+                refs.append(ref)
+                known.add(ref.artifact_id)
+        return refs
+
+    def _turns_for_state(self, state: TicketState) -> list[ConversationTurn]:
+        turns: list[ConversationTurn] = []
+        for turn in _conversation_turns(state):
+            if turn.role != "assistant" or len(turn.content) <= MAX_INLINE_ASSISTANT_TURN_CHARS:
+                turns.append(turn)
+                continue
+            ref = self._artifact_store.put(
+                {"text": turn.content},
+                kind="assistant_turn",
+                source_turn_id=turn.id,
+                label="legacy-assistant-answer",
+            )
+            turns.append(
+                replace(
+                    turn,
+                    content=(
+                        "長文のlegacy assistant回答は成果物へ保存されました。\n"
+                        f"artifact_id: {ref.artifact_id}\nlabel: legacy-assistant-answer"
+                    ),
+                )
+            )
+        return turns
+
+    def _persist_step_artifacts(
+        self,
+        state: TicketState,
+        result: SkillExecutionResult,
+        *,
+        step: TaskStep,
+        step_index: int,
+    ) -> tuple[list[ArtifactRef], dict[str, dict[str, Any]]]:
+        source_turn_id = _latest_turn_id(state)
+        source_step_id = f"step-{step_index + 1}"
+        refs: list[ArtifactRef] = []
+        for artifact_index, artifact in enumerate(result.artifacts, 1):
+            refs.append(
+                self._artifact_store.put(
+                    artifact,
+                    kind="tool_output" if step.kind == "tool" else "step_artifact",
+                    source_turn_id=source_turn_id,
+                    source_step_id=source_step_id,
+                    label=f"{source_step_id}-artifact-{artifact_index}",
+                )
+            )
+        step_output = {
+            "status": result.status,
+            "assistant_turn_text": _canonical_result_text(result),
+            "target_url": result.target_url,
+            "page_title": result.page_title,
+            "briefing": result.briefing,
+            "bookmark_url": result.bookmark_url,
+            "bookmark_payload": result.bookmark_payload,
+        }
+        refs.append(
+            self._artifact_store.put(
+                step_output,
+                kind="step_output",
+                source_turn_id=source_turn_id,
+                source_step_id=source_step_id,
+                label=step.output_artifact_name or source_step_id,
+            )
+        )
+        refs = _deduplicate_refs(refs)
+        active = {
+            key: dict(value)
+            for key, value in state.get("active_artifacts", {}).items()
+            if isinstance(value, dict)
+        }
+        logical_name = step.output_artifact_name or source_step_id
+        previous = active.get(logical_name, {})
+        previous_version = previous.get("version")
+        version = previous_version + 1 if isinstance(previous_version, int) else 1
+        active[logical_name] = {
+            "version": version,
+            "artifact_id": refs[-1].artifact_id,
+        }
+        return refs, active
+
     def _finalize_execution(self, state: TicketState) -> dict[str, Any]:
         plan = _task_plan_from_dict(state["current_plan"])
         if not state.get("plan_steps") and plan.decision == "needs_user":
+            answer = plan.user_request or plan.reason
             result = SkillExecutionResult(
                 status="needs_user",
-                events=(SkillEvent("final_review", plan.user_request or plan.reason),),
+                events=(SkillEvent("final_review", answer),),
+                assistant_turn_text=answer,
                 dry_run=bool(state.get("dry_run", False)),
             )
             event = result.events[0]
             self._emit(event)
+            turn_update = self._record_assistant_turn(state, answer)
+            result = replace(
+                result,
+                artifacts=tuple(turn_update["assistant_artifact_refs"]),
+            )
             return {
-                "messages": [AIMessage(content=event.notes or "")],
-                "last_result": _execution_result_dict(result),
+                "last_result": _execution_result_dict(
+                    result, include_assistant_turn=True
+                ),
                 "waiting_reason": result.status,
                 "run_status": result.status,
+                "recent_turns": turn_update["recent_turns"],
+                "artifact_refs": turn_update["artifact_refs"],
+                "artifacts": turn_update["artifact_refs"],
+                "active_artifacts": turn_update["active_artifacts"],
+                "working_memory": WorkingMemory(
+                    issue=_working_issue(state["issue"]),
+                    current_plan=_task_plan_dict(plan),
+                    plan_steps=tuple(state.get("plan_steps", [])),
+                    run_status=result.status,
+                    waiting_reason=result.status,
+                    active_artifacts=turn_update["active_artifacts"],
+                ).to_dict(),
             }
 
         status = _final_execution_status(
@@ -473,35 +779,46 @@ class TicketConversationGraph:
             plan=plan,
             status=status,
         )
-        messages: list[AnyMessage] = []
         if status in ("processed", "already_done", "dry_run"):
             progress_event = SkillEvent("progress", final_step_event.notes)
             self._emit(progress_event)
-            if progress_event.notes:
-                messages.append(AIMessage(content=progress_event.notes))
             review_event = SkillEvent("final_review", "作業が終了しました。")
             self._emit(review_event)
-            messages.append(AIMessage(content=review_event.notes))
         else:
             self._emit(final_step_event)
-            if final_step_event.notes:
-                messages.append(AIMessage(content=final_step_event.notes))
+
+        answer = self._latest_step_assistant_text(state) or final_step_event.notes or "作業が終了しました。"
+        turn_update = self._record_assistant_turn(state, answer)
 
         result = SkillExecutionResult(
             status=status,
             events=(),
-            artifacts=tuple(state.get("artifacts", [])),
+            artifacts=tuple(turn_update["assistant_artifact_refs"]),
+            assistant_turn_text=answer,
             dry_run=bool(state.get("dry_run", False)),
         )
         step_context = dict(state.get("step_context", {}))
         step_context["last_result_status"] = status
         return {
-            "messages": messages,
-            "last_result": _execution_result_dict(result),
+            "last_result": _execution_result_dict(
+                result, include_assistant_turn=True
+            ),
             "current_step_index": None if status in ("processed", "already_done", "dry_run") else state.get("current_step_index"),
             "run_status": status,
             "step_context": step_context,
             "waiting_reason": status,
+            "recent_turns": turn_update["recent_turns"],
+            "artifact_refs": turn_update["artifact_refs"],
+            "artifacts": turn_update["artifact_refs"],
+            "active_artifacts": turn_update["active_artifacts"],
+            "working_memory": WorkingMemory(
+                issue=_working_issue(state["issue"]),
+                current_plan=_task_plan_dict(plan),
+                plan_steps=tuple(state.get("plan_steps", [])),
+                run_status=status,
+                waiting_reason=status,
+                active_artifacts=turn_update["active_artifacts"],
+            ).to_dict(),
         }
 
     def _request_feedback(self, state: TicketState) -> dict[str, Any]:
@@ -509,12 +826,133 @@ class TicketConversationGraph:
         event = SkillEvent("final_review", notes)
         self._emit(event)
         result = SkillExecutionResult(status="needs_user", events=())
+        turn_update = self._record_assistant_turn(state, notes)
+        result = replace(
+            result,
+            assistant_turn_text=notes,
+            artifacts=tuple(turn_update["assistant_artifact_refs"]),
+        )
         return {
-            "messages": [AIMessage(content=notes)],
-            "last_result": _execution_result_dict(result),
+            "last_result": _execution_result_dict(
+                result, include_assistant_turn=True
+            ),
             "waiting_reason": "needs_user",
             "run_status": "needs_user",
+            "recent_turns": turn_update["recent_turns"],
+            "artifact_refs": turn_update["artifact_refs"],
+            "artifacts": turn_update["artifact_refs"],
+            "active_artifacts": turn_update["active_artifacts"],
+            "working_memory": WorkingMemory(
+                issue=_working_issue(state["issue"]),
+                current_plan=(
+                    dict(state["current_plan"])
+                    if isinstance(state.get("current_plan"), dict)
+                    else None
+                ),
+                plan_steps=tuple(state.get("plan_steps", [])),
+                run_status="needs_user",
+                waiting_reason="needs_user",
+                active_artifacts=turn_update["active_artifacts"],
+            ).to_dict(),
         }
+
+    def _record_assistant_turn(
+        self, state: TicketState, text: str
+    ) -> dict[str, Any]:
+        recent_turns = _conversation_turns(state)
+        turn_id = f"assistant-{len(recent_turns) + 1}"
+        ref = self._artifact_store.put(
+            {"text": text},
+            kind="assistant_turn",
+            source_turn_id=turn_id,
+            label="assistant-answer",
+        )
+        turn_content = (
+            text
+            if len(text) <= MAX_INLINE_ASSISTANT_TURN_CHARS
+            else (
+                "長文のassistant回答は成果物へ保存されました。\n"
+                f"artifact_id: {ref.artifact_id}\nlabel: assistant-answer"
+            )
+        )
+        turn = ConversationTurn(id=turn_id, role="assistant", content=turn_content)
+        recent_turns.append(turn)
+        refs = _deduplicate_refs([*self._refs_for_state(state), ref])
+        active = {
+            key: dict(value)
+            for key, value in state.get("active_artifacts", {}).items()
+            if isinstance(value, dict)
+        }
+        previous = active.get("assistant-answer", {})
+        previous_version = previous.get("version")
+        active["assistant-answer"] = {
+            "version": previous_version + 1 if isinstance(previous_version, int) else 1,
+            "artifact_id": ref.artifact_id,
+        }
+        return {
+            "recent_turns": [item.to_dict() for item in recent_turns],
+            "artifact_refs": [item.to_dict() for item in refs],
+            "assistant_artifact_refs": [ref.to_dict()],
+            "active_artifacts": active,
+        }
+
+    def _persist_initial_assistant_turns(
+        self, turns: list[ConversationTurn]
+    ) -> tuple[
+        list[ConversationTurn],
+        list[ArtifactRef],
+        dict[str, dict[str, Any]],
+    ]:
+        persisted: list[ConversationTurn] = []
+        refs: list[ArtifactRef] = []
+        active: dict[str, dict[str, Any]] = {}
+        version = 0
+        for turn in turns:
+            if turn.role != "assistant":
+                persisted.append(turn)
+                continue
+            ref = self._artifact_store.put(
+                {"text": turn.content},
+                kind="assistant_turn",
+                source_turn_id=turn.id,
+                label="assistant-answer",
+            )
+            refs.append(ref)
+            version += 1
+            active["assistant-answer"] = {
+                "version": version,
+                "artifact_id": ref.artifact_id,
+            }
+            if len(turn.content) > MAX_INLINE_ASSISTANT_TURN_CHARS:
+                persisted.append(
+                    replace(
+                        turn,
+                        content=(
+                            "長文のassistant回答は成果物へ保存されました。\n"
+                            f"artifact_id: {ref.artifact_id}\nlabel: assistant-answer"
+                        ),
+                    )
+                )
+            else:
+                persisted.append(turn)
+        return persisted, _deduplicate_refs(refs), active
+
+    def _latest_step_assistant_text(self, state: TicketState) -> str | None:
+        for step_result in reversed(state.get("step_results", [])):
+            artifacts = step_result.get("artifacts") if isinstance(step_result, dict) else None
+            if not isinstance(artifacts, list):
+                continue
+            for artifact in reversed(artifacts):
+                if not isinstance(artifact, dict) or artifact.get("kind") != "step_output":
+                    continue
+                artifact_id = artifact.get("artifact_id")
+                if not isinstance(artifact_id, str):
+                    continue
+                content = self._artifact_store.get(artifact_id)
+                text = content.get("assistant_turn_text") if isinstance(content, dict) else None
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+        return None
 
     def _emit(self, event: SkillEvent) -> None:
         if self._event_sink is not None:
@@ -527,26 +965,20 @@ class TicketConversationGraph:
         *,
         existing_messages: list[AnyMessage],
     ) -> dict[str, Any]:
-        journal_messages: list[dict[str, str]] = []
-        existing_ai_content = {
-            str(message.content).strip()
-            for message in existing_messages
-            if isinstance(message, AIMessage)
-        }
+        journal_messages: list[dict[str, Any]] = []
         for journal in _journals(issue):
             journal_id = _journal_id(journal)
             notes = _journal_notes(journal)
             if not notes:
                 continue
             if _journal_user_id(journal) in self._ai_user_ids:
-                if notes not in existing_ai_content:
-                    journal_messages.append(
-                        {"role": "assistant", "content": notes}
-                    )
+                continue
             else:
                 if journal_id <= cursor:
                     continue
-                journal_messages.append({"role": "user", "content": notes})
+                journal_messages.append(
+                    {"role": "user", "content": notes, "journal_id": journal_id}
+                )
         return {
             "issue": _without_journals(issue),
             "journal_messages": journal_messages,
@@ -555,8 +987,8 @@ class TicketConversationGraph:
 
 
 def _revision_messages(
-    state: TicketState,
     *,
+    context_messages: list[dict[str, Any]],
     skills: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     previous_response: str | None,
@@ -567,7 +999,7 @@ def _revision_messages(
             "role": "system",
             "content": (
                 "あなたは差し戻されたRedmineチケットの再計画担当です。"
-                "会話履歴全体から過去の作業と最新の人間コメントを読み取り、質問か作業依頼かにかかわらず必ず計画してください。"
+                "session checkpoint、直近会話、artifact catalogから過去の作業と最新の人間コメントを読み取り、質問か作業依頼かにかかわらず必ず計画してください。"
                 "保存済みの会話だけで回答できる場合はno_skillを選び、外部toolやskillを再実行しないでください。"
                 "Redmineへの計画・結果の投稿はシステムが行います。完了済みの外部操作を理由なく繰り返してはいけません。"
                 "再計画では必ず作業ステップに分解し、各ステップをskill/tool/llm/unavailableのいずれかに分類してください。"
@@ -576,6 +1008,10 @@ def _revision_messages(
                 "toolステップのnameには利用可能なtoolのnameだけを正確に入れてください。説明文、表示名、括弧付き表記を混ぜないでください。"
                 "ユーザーが `web_search_pages` のようなtool名を明示した場合、nameにはその文字列だけを入れてください。"
                 "skillステップのnameにも利用可能なskillのnameだけを正確に入れてください。"
+                "depends_onは同一計画内の先行step番号だけを1始まりで指定してください。"
+                "input_artifact_idsはartifact catalogに存在し、そのstepで本文を読む成果物だけを指定してください。"
+                "output_artifact_nameは生成成果物の安定した論理名を指定し、不要ならnullにしてください。"
+                "過去成果物への参照候補が複数あり一意に選べない場合は、推測せずneeds_userで確認してください。"
                 "task_inputは補足指示が必要な場合だけinstructionとtarget_urlを設定してください。"
                 "出力構造と型はAPI側で指定されています。\n"
                 f"利用可能なスキル: {json.dumps(skills, ensure_ascii=False)}\n"
@@ -583,28 +1019,7 @@ def _revision_messages(
             ),
         }
     ]
-    state_messages = state.get("messages", [])
-    last_human_index = max(
-        (
-            index
-            for index, message in enumerate(state_messages)
-            if isinstance(message, HumanMessage)
-        ),
-        default=-1,
-    )
-    for index, message in enumerate(state_messages):
-        role = "assistant" if isinstance(message, AIMessage) else "user"
-        content = str(message.content)
-        if index == last_human_index and content.startswith(
-            "Redmineへの追加コメント:\n"
-        ):
-            human_comment = content.removeprefix("Redmineへの追加コメント:\n")
-            content = (
-                "このチケットは人間からAIエージェントへ差し戻されました。\n\n"
-                f"人間の追加コメント:\n{human_comment}\n\n"
-                "これまでの会話コンテキストを踏まえて、改めて作業を計画してください。"
-            )
-        messages.append({"role": role, "content": content})
+    messages.extend(context_messages)
     if previous_error:
         messages.append(
             {
@@ -801,6 +1216,9 @@ def _plan_step_state(*, index: int, step: Any) -> dict[str, Any]:
         "name": step.name,
         "purpose": step.purpose,
         "arguments": step.arguments,
+        "depends_on": list(step.depends_on),
+        "input_artifact_ids": list(step.input_artifact_ids),
+        "output_artifact_name": step.output_artifact_name,
         "status": "pending",
         "result": None,
         "error": None,
@@ -913,12 +1331,6 @@ def _final_execution_status(state: TicketState, *, dry_run: bool) -> str:
     return "dry_run" if dry_run else "processed"
 
 
-def _execution_conversation_messages(state: TicketState) -> list[dict[str, Any]] | None:
-    if not isinstance(state.get("feedback_analysis"), dict):
-        return None
-    return _message_dicts(state.get("messages", []))
-
-
 def _is_revision_step_resume(
     values: dict[str, Any],
     next_nodes: tuple[str, ...],
@@ -965,17 +1377,22 @@ def _task_plan_from_dict(data: dict[str, Any] | None) -> TaskPlan:
     return parse_task_plan(json.dumps(data, ensure_ascii=False))
 
 
-def _execution_result_dict(result: SkillExecutionResult) -> dict[str, Any]:
-    return {
+def _execution_result_dict(
+    result: SkillExecutionResult, *, include_assistant_turn: bool = False
+) -> dict[str, Any]:
+    data = {
         "status": result.status,
         "target_url": result.target_url,
         "page_title": result.page_title,
-        "briefing": result.briefing,
+        "briefing": None,
         "bookmark_url": result.bookmark_url,
-        "bookmark_payload": result.bookmark_payload,
+        "bookmark_payload": None,
         "artifacts": list(result.artifacts),
         "dry_run": result.dry_run,
     }
+    if include_assistant_turn:
+        data["assistant_turn_text"] = result.assistant_turn_text
+    return data
 
 
 def _execution_result_from_dict(
@@ -991,6 +1408,11 @@ def _execution_result_from_dict(
         bookmark_payload=data.get("bookmark_payload"),
         artifacts=tuple(
             item for item in data.get("artifacts", []) if isinstance(item, dict)
+        ),
+        assistant_turn_text=(
+            str(data["assistant_turn_text"])
+            if data.get("assistant_turn_text") is not None
+            else None
         ),
         dry_run=bool(data.get("dry_run", dry_run)),
     )
@@ -1022,6 +1444,182 @@ def _initial_issue_message(issue: dict[str, Any]) -> str:
     )
 
 
+def _initial_conversation_turns(
+    issue: dict[str, Any], ai_user_ids: Collection[int]
+) -> list[ConversationTurn]:
+    turns = [
+        ConversationTurn(
+            id=f"issue-{_require_issue_id(issue)}",
+            role="user",
+            content=_initial_issue_message(issue),
+        )
+    ]
+    pending_human: list[str] = []
+    pending_ids: list[int] = []
+
+    def flush_human() -> None:
+        if not pending_human:
+            return
+        turns.append(
+            ConversationTurn(
+                id=f"journal-{max(pending_ids) if pending_ids else len(turns)}",
+                role="user",
+                content="\n\n".join(pending_human),
+                journal_ids=tuple(pending_ids),
+            )
+        )
+        pending_human.clear()
+        pending_ids.clear()
+
+    for journal in _journals(issue):
+        notes = _journal_notes(journal)
+        if not notes:
+            continue
+        journal_id = _journal_id(journal)
+        if _journal_user_id(journal) in ai_user_ids:
+            flush_human()
+            turns.append(
+                ConversationTurn(
+                    id=f"journal-{journal_id}",
+                    role="assistant",
+                    content=notes,
+                    journal_ids=(journal_id,),
+                )
+            )
+        else:
+            pending_human.append(notes)
+            pending_ids.append(journal_id)
+    flush_human()
+    return turns
+
+
+def _conversation_turns(state: TicketState) -> list[ConversationTurn]:
+    raw_turns = state.get("recent_turns")
+    if isinstance(raw_turns, list):
+        return [
+            ConversationTurn.from_dict(item)
+            for item in raw_turns
+            if isinstance(item, dict) and item.get("content")
+        ]
+    turns: list[ConversationTurn] = []
+    for index, message in enumerate(state.get("messages", []), 1):
+        turns.append(
+            ConversationTurn(
+                id=f"legacy-turn-{index}",
+                role="assistant" if isinstance(message, AIMessage) else "user",
+                content=str(message.content),
+            )
+        )
+    return turns
+
+
+def _working_memory(
+    state: TicketState, *, issue: dict[str, Any] | None = None
+) -> WorkingMemory:
+    return WorkingMemory(
+        issue=_working_issue(issue or dict(state.get("issue", {}))),
+        current_plan=(
+            dict(state["current_plan"])
+            if isinstance(state.get("current_plan"), dict)
+            else None
+        ),
+        plan_steps=tuple(
+            dict(item) for item in state.get("plan_steps", []) if isinstance(item, dict)
+        ),
+        run_status=str(state.get("run_status") or "initialized"),
+        waiting_reason=(
+            str(state["waiting_reason"])
+            if state.get("waiting_reason") is not None
+            else None
+        ),
+        active_artifacts={
+            key: dict(value)
+            for key, value in state.get("active_artifacts", {}).items()
+            if isinstance(value, dict)
+        },
+    )
+
+
+def _artifact_refs(state: TicketState) -> list[ArtifactRef]:
+    raw = state.get("artifact_refs")
+    if not isinstance(raw, list):
+        raw = state.get("artifacts", [])
+    refs: list[ArtifactRef] = []
+    for item in raw:
+        if not isinstance(item, dict) or "artifact_id" not in item:
+            continue
+        try:
+            refs.append(ArtifactRef.from_dict(item))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return _deduplicate_refs(refs)
+
+
+def _deduplicate_refs(refs: list[ArtifactRef]) -> list[ArtifactRef]:
+    result: list[ArtifactRef] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if ref.artifact_id in seen:
+            continue
+        seen.add(ref.artifact_id)
+        result.append(ref)
+    return result
+
+
+def _latest_turn_id(state: TicketState) -> str | None:
+    turns = _conversation_turns(state)
+    return turns[-1].id if turns else None
+
+
+def _selected_step_artifact_ids(
+    state: TicketState, *, step: TaskStep, step_index: int
+) -> tuple[str, ...]:
+    selected = list(step.input_artifact_ids)
+    plan_steps = state.get("plan_steps", [])
+    for dependency in step.depends_on:
+        dependency_index = dependency - 1
+        if dependency_index < 0 or dependency_index >= step_index:
+            raise ContextEngineError(
+                f"step {step_index + 1} has an invalid dependency: {dependency}"
+            )
+        dependency_state = plan_steps[dependency_index]
+        if dependency_state.get("status") != "completed":
+            raise ContextEngineError(
+                f"step {step_index + 1} depends on incomplete step {dependency}"
+            )
+        for artifact in dependency_state.get("artifacts", []):
+            if isinstance(artifact, dict) and isinstance(artifact.get("artifact_id"), str):
+                selected.append(artifact["artifact_id"])
+    return tuple(dict.fromkeys(selected))
+
+
+def _context_error_notes(exc: ContextEngineError) -> str:
+    if isinstance(exc, ContextLimitExceeded):
+        return (
+            "入力がモデルのcontext上限を超えています。対象を分割するか、参照する成果物を絞ってください。\n"
+            f"入力サイズ内訳: {json.dumps(exc.breakdown, ensure_ascii=False, sort_keys=True)}"
+        )
+    return f"会話contextを安全に準備できませんでした。\n理由: {exc}"
+
+
+def _canonical_result_text(result: SkillExecutionResult) -> str | None:
+    if result.assistant_turn_text and result.assistant_turn_text.strip():
+        return result.assistant_turn_text.strip()
+    for event in reversed(result.events):
+        if event.kind in ("final_review", "final_return") and event.notes:
+            return event.notes.strip()
+    return None
+
+
+def _context_error_plan(exc: ContextEngineError) -> TaskPlan:
+    notes = _context_error_notes(exc)
+    return TaskPlan(
+        decision="needs_user",
+        reason=notes,
+        user_request=notes,
+    )
+
+
 def _message_dicts(messages: list[AnyMessage]) -> list[dict[str, Any]]:
     return [
         {
@@ -1034,6 +1632,14 @@ def _message_dicts(messages: list[AnyMessage]) -> list[dict[str, Any]]:
 
 def _without_journals(issue: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in issue.items() if key != "journals"}
+
+
+def _working_issue(issue: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in issue.items()
+        if key not in {"journals", "description", "selected_artifacts"}
+    }
 
 
 def _journals(issue: dict[str, Any]) -> list[dict[str, Any]]:

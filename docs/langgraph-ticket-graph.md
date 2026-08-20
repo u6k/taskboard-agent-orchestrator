@@ -4,7 +4,7 @@
 
 ## 目的
 
-`TicketConversationGraph` は、Redmineチケット1件をLangGraph threadとして扱い、会話履歴、実行計画、step単位の実行状態、差し戻し後の再計画をcheckpointへ保存する。
+`TicketConversationGraph` は、Redmineチケット1件をLangGraph threadかつ会話sessionとして扱い、model-visible context、実行計画、step単位の実行状態、artifact参照、差し戻し後の再計画をcheckpointへ保存する。
 
 Redmine API更新はこのグラフから直接行わない。グラフは `SkillEvent` をemitし、`workflow.py` がRedmineコメント、ステータス、担当者変更へ変換する。
 
@@ -44,16 +44,16 @@ flowchart TD
 
 | ノード | 責務 | 主なstate更新 |
 | --- | --- | --- |
-| `initialize` | Redmine issue本文とjournalをLangChain messageへ変換し、初期stateを作る。設定済みエージェントユーザーのコメントは `AIMessage`、それ以外は `HumanMessage` として扱う。 | `issue_id`, `issue`, `messages`, `last_ingested_journal_id`, `plan_steps`, `step_results`, `run_status` |
-| `initial_plan` | `TaskOrchestrator.create_plan()` で初回計画を作る。旧形式のstepなし計画は実行可能な単一stepへ補完する。 | `current_plan`, `plan_steps`, `current_step_index`, `step_context` |
-| `publish_initial_plan` | 初回計画をRedmine向け `start` イベントとしてemitし、会話履歴にも残す。 | `messages` |
-| `select_next_step` | `pending` または `running` のstepを1件選び、`running` にする。step開始を `progress` イベントとしてemitする。 | `plan_steps`, `current_step_index`, `run_status`, `messages` |
-| `execute_step` | `TaskOrchestrator.execute_single_step()` に1stepだけ渡して実行する。結果、artifact、stepイベントをstateへ保存し、step結果を `progress` としてemitする。 | `plan_steps`, `step_results`, `current_step_index`, `run_status`, `step_context`, `artifacts`, `messages` |
-| `finalize_execution` | 全stepの状態から実行全体の最終statusを決める。成功系は `progress` と `final_review`、失敗・判断待ちは `final_return` または `final_review` をemitする。 | `last_result`, `run_status`, `waiting_reason`, `current_step_index`, `step_context`, `messages` |
-| `wait_for_human` | LangGraph `interrupt()` で停止し、次回実行時のresume payloadから新しいRedmine journalを取り込む。 | `issue`, `messages`, `last_ingested_journal_id`, `has_human_feedback`, `feedback_analysis` |
-| `analyze_feedback` | 人間コメントをLLMで解析し、維持する成果、やり直す作業、再計画を構造化する。 | `feedback_analysis`, `current_plan`, `plan_steps`, `current_step_index`, `step_context` |
-| `publish_revision_plan` | 差し戻し解析結果と再計画を `start` イベントとしてemitし、会話履歴に残す。 | `messages` |
-| `request_feedback` | resume時に人間の追加指示が確認できない場合、修正内容の追記を求めてレビュー戻しにする。 | `last_result`, `waiting_reason`, `run_status`, `messages` |
+| `initialize` | issue本文とjournalを`ConversationTurn`へ変換し、session stateを作る。legacyの長いassistant turnはartifact化する。 | `working_memory`, `session_checkpoint`, `recent_turns`, `active_artifacts`, `artifact_refs` |
+| `initial_plan` | context engineでplanning入力を組み立てて初回計画を作る。 | `current_plan`, `plan_steps`, `working_memory`, `session_checkpoint`, `recent_turns` |
+| `publish_initial_plan` | 初回計画をRedmine向け `start` イベントとしてemitする。conversation turnにはしない。 | なし |
+| `select_next_step` | `pending` または `running` のstepを1件選び、`running` にする。 | `plan_steps`, `current_step_index`, `run_status` |
+| `execute_step` | 選択artifact本文だけを含むcontextで1step実行し、成果物本文をartifact store、参照をstateへ保存する。 | `working_memory`, `plan_steps`, `step_results`, `active_artifacts`, `artifact_refs` |
+| `finalize_execution` | 全体statusを決め、正規assistant回答だけをturnとartifactへ保存する。Redmineイベント仕様は維持する。 | `last_result`, `working_memory`, `recent_turns`, `active_artifacts`, `artifact_refs` |
+| `wait_for_human` | interrupt後、新しい人間journalをID順に1 user turnへまとめる。AI progress journalはturnへ再取り込みしない。 | `issue`, `recent_turns`, `last_ingested_journal_id`, `working_memory` |
+| `analyze_feedback` | session contextから差し戻しを解析して再計画する。必要なら古いturnをcompactionする。 | `feedback_analysis`, `current_plan`, `working_memory`, `session_checkpoint`, `recent_turns` |
+| `publish_revision_plan` | 再計画を `start` イベントとしてemitする。conversation turnにはしない。 | なし |
+| `request_feedback` | 追加指示不足をレビュー戻しし、正規回答だけをturn/artifact化する。 | `last_result`, `working_memory`, `recent_turns`, `artifact_refs` |
 
 ## 主要state
 
@@ -61,15 +61,20 @@ flowchart TD
 | --- | --- |
 | `issue_id` | Redmine issue ID。thread IDは `redmine-issue-{issue_id}` を使う。dry-runでは `-dry-run` suffixを付ける。 |
 | `issue` | journalを除いたissue情報。resume時は最新issueで更新する。 |
-| `messages` | チケット本文、Redmineコメント、計画、実行結果を保持する会話履歴。LangGraphの `add_messages` reducerで追加される。 |
+| `messages` | legacy checkpoint遅延変換用。新規stateでは空で、モデル入力には使わない。 |
+| `working_memory` | issue、現在計画、step状態、run status、待機理由、active artifactを決定的に表した実行メモリ。 |
+| `session_checkpoint` | 圧縮済み会話の要約、決定、制約、未解決事項、現在位置、選択artifact、圧縮済みturn ID。 |
+| `recent_turns` | 未圧縮のuser/assistant正規turn。計画・progress・tool内部ログは含めない。 |
+| `active_artifacts` | 論理名からversionとartifact IDへの対応。過去版は削除しない。 |
+| `artifact_refs` | content-addressed artifactのID、種類、byte数、hash、source、表示名、field一覧。本文は含めない。 |
 | `last_ingested_journal_id` | 取り込み済みRedmine journalの最大ID。resume時に重複取り込みを避ける。 |
 | `current_plan` | 現在実行中の `TaskPlan` をdict化したもの。 |
 | `plan_steps` | 実行計画のstep配列。stepは削除せず `status` を更新する。 |
 | `current_step_index` | 現在実行中または停止中のstep index。成功完了時は `None` に戻す。 |
 | `step_results` | 実行済みstepごとの結果履歴。step ID、status、実行結果、イベント、artifactを保存する。 |
 | `run_status` | グラフ全体の現在status。例: `initialized`, `planned`, `running`, `processed`, `failed`, `needs_user`, `missing_tool`, `dry_run`。 |
-| `step_context` | step実行間で共有する会話文脈、計画理由、制約、最後のstatusなど。 |
-| `artifacts` | step実行で得た成果物メタデータ。 |
+| `step_context` | 計画理由、制約、最後のstatusなどの小さな互換メタデータ。会話本文は保持しない。 |
+| `artifacts` | `artifact_refs`と同じ参照形式を保持する互換field。成果物本文は保持しない。 |
 | `feedback_analysis` | 差し戻しコメントを解析した構造化結果。 |
 | `waiting_reason` | `wait_for_human` で停止する理由。 |
 | `last_result` | `TicketConversationGraph.run()` が返す最終 `SkillExecutionResult` 相当のdict。 |

@@ -44,3 +44,7 @@ def log_trace(trace_id: str) -> Iterator[None]:
         yield
     finally:
         _trace_id.reset(token)
+
+
+def current_trace_id() -> str:
+    return _trace_id.get()

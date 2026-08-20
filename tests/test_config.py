@@ -55,13 +55,14 @@ def test_load_config_reads_multiple_agent_profiles(
     agents_file = tmp_path / "agents.toml"
     agents_file.write_text(
         """
-version = 1
+version = 2
 
 [[agents]]
 id = "research"
 redmine_user_id = 42
 redmine_api_key = "redmine-research-key"
 llm_model = "openai/test-model"
+context_window_tokens = 128000
 llm_api_base = "https://llm.example.test/v1"
 llm_api_key = "llm-research-key"
 llm_timeout_seconds = 1200
@@ -72,6 +73,7 @@ id = "local"
 redmine_user_id = 43
 redmine_api_key = "redmine-local-key"
 llm_model = "lm_studio/local-model"
+context_window_tokens = 32768
 llm_api_key = ""
 """.strip(),
         encoding="utf-8",
@@ -125,6 +127,7 @@ id = "primary"
 redmine_user_id = 43
 redmine_api_key = "other"
 llm_model = "other"
+context_window_tokens = 128000
 llm_api_key = "other"
 """,
             "duplicate agent id",
@@ -136,6 +139,7 @@ id = "secondary"
 redmine_user_id = 42
 redmine_api_key = "other"
 llm_model = "other"
+context_window_tokens = 128000
 llm_api_key = "other"
 """,
             "duplicate agent redmine_user_id",
@@ -222,6 +226,40 @@ def test_load_config_does_not_fall_back_to_legacy_agent_env(
         load_config(env_file, tmp_path / "missing.toml")
 
 
+def test_load_config_rejects_version_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clear_env(monkeypatch)
+    env_file = tmp_path / ".env"
+    _write_shared_env(env_file)
+    agents_file = _write_minimal_agents(tmp_path)
+    agents_file.write_text(
+        agents_file.read_text(encoding="utf-8").replace("version = 2", "version = 1"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="version must be 2"):
+        load_config(env_file, agents_file)
+
+
+def test_load_config_requires_context_window_tokens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clear_env(monkeypatch)
+    env_file = tmp_path / ".env"
+    _write_shared_env(env_file)
+    agents_file = _write_minimal_agents(tmp_path)
+    agents_file.write_text(
+        agents_file.read_text(encoding="utf-8").replace(
+            "context_window_tokens = 128000\n", ""
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="context_window_tokens must be an integer"):
+        load_config(env_file, agents_file)
+
+
 def _write_minimal_agents(
     tmp_path: Path,
     *,
@@ -231,13 +269,14 @@ def _write_minimal_agents(
     agents_file = tmp_path / "agents.toml"
     agents_file.write_text(
         f"""
-version = 1
+version = 2
 
 [[agents]]
 id = "primary"
 redmine_user_id = 42
 redmine_api_key = "redmine-key"
 llm_model = "test-model"
+context_window_tokens = 128000
 llm_api_key = "llm-key"
 {profile_extra}
 {suffix}

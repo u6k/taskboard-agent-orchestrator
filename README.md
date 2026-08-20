@@ -87,13 +87,13 @@ LINKACE_SUMMARIZED_LIST_ID=10
 LANGGRAPH_CHECKPOINT_DB_PATH=.taskboard-agent/checkpoints.sqlite3
 ```
 
-`agents.example.toml` を `agents.toml` にコピーし、Redmine担当者ごとのAPIキー、言語モデル、LLM endpoint、LLM APIキーを設定します。`llm_timeout_seconds` と `system_prompt_file` は任意です。
+`agents.example.toml` を `agents.toml` にコピーし、Redmine担当者ごとのAPIキー、言語モデル、実際のcontext window、LLM endpoint、LLM APIキーを設定します。`llm_timeout_seconds` と `system_prompt_file` は任意です。
 
 ```powershell
 Copy-Item agents.example.toml agents.toml
 ```
 
-`LANGGRAPH_CHECKPOINT_DB_PATH` はチケット単位のLangGraph会話コンテキストを保存するSQLiteファイルです。`--dry-run` ではインメモリCheckpointerを使用するため、このファイルは更新されません。
+`LANGGRAPH_CHECKPOINT_DB_PATH` はチケット単位のLangGraph実行状態とmodel-visible contextを保存するSQLiteファイルです。長文成果物はその親ディレクトリの`artifacts/`へcontent-addressed JSONとして保存します。`--dry-run`ではCheckpointerとartifact storeの両方をインメモリにするため、ファイルは更新されません。
 
 言語モデルの呼び出しはLiteLLM経由で行います。プロフィールの `llm_model` には `openai/gpt-4.1-mini`、`anthropic/claude-...`、`gemini/...`、`ollama/...`、`lm_studio/...` などLiteLLMが扱うモデル名を指定します。`llm_api_base` は省略でき、認証不要のローカルモデルでは `llm_api_key = ""` を指定できます。詳細は [docs/agent-profiles.md](docs/agent-profiles.md) を参照してください。
 

@@ -9,7 +9,12 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 
-from taskboard_agent.llm import LLMResponse, LLMToolCall, with_agent_system_prompt
+from taskboard_agent.llm import (
+    LLMCallMetricsCallback,
+    LLMResponse,
+    LLMToolCall,
+    with_agent_system_prompt,
+)
 from taskboard_agent.tools import ToolExecutionResult, require_tool_policy
 
 
@@ -43,6 +48,7 @@ class LangChainAgentRunner:
         on_llm_response: Callable[[LLMResponse], None] | None = None,
         response_format: dict[str, Any] | None = None,
         return_after_tool_names: set[str] | None = None,
+        operation: str = "skill_agent",
     ) -> AgentRunResult:
         if tools is None:
             raise RuntimeError("LangChain agent runner requires tools")
@@ -60,9 +66,19 @@ class LangChainAgentRunner:
             response_format=_langchain_response_schema(response_format),
             interrupt_after=["tools"] if return_after_tool_names else None,
         )
+        model_name = str(getattr(self._model, "model", None) or getattr(self._model, "model_name", "unknown"))
         result = agent.invoke(
             {"messages": with_agent_system_prompt(messages, self._system_prompt)},
-            config={"recursion_limit": max(self._max_steps * 2, 2)},
+            config={
+                "recursion_limit": max(self._max_steps * 2, 2),
+                "callbacks": [
+                    LLMCallMetricsCallback(
+                        model=model_name,
+                        operation=operation,
+                        tool_count=len(guarded_tools),
+                    )
+                ],
+            },
         )
         output_messages = tuple(result.get("messages", ()))
         if on_llm_response is not None:
@@ -87,7 +103,14 @@ class LangChainAgentRunner:
                             "指定された出力構造で返してください。追加のtoolは呼び出さないでください。"
                         )
                     ),
-                ]
+                ],
+                config={
+                    "callbacks": [
+                        LLMCallMetricsCallback(
+                            model=model_name, operation="structured_final"
+                        )
+                    ]
+                },
             )
         final_text = (
             json.dumps(_jsonable_structured_response(structured_response), ensure_ascii=False)

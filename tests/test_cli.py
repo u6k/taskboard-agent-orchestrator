@@ -85,13 +85,14 @@ def test_build_runtime_uses_each_profile_connection_settings(
     agents_file = tmp_path / "agents.toml"
     agents_file.write_text(
         """
-version = 1
+version = 2
 
 [[agents]]
 id = "first"
 redmine_user_id = 42
 redmine_api_key = "redmine-first"
 llm_model = "provider/first"
+context_window_tokens = 128000
 llm_api_base = "https://first.example.test/v1"
 llm_api_key = "llm-first"
 llm_timeout_seconds = 300
@@ -101,6 +102,7 @@ id = "second"
 redmine_user_id = 43
 redmine_api_key = "redmine-second"
 llm_model = "provider/second"
+context_window_tokens = 128000
 llm_api_base = "https://second.example.test/v1"
 llm_api_key = "llm-second"
 llm_timeout_seconds = 1200

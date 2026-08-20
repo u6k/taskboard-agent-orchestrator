@@ -20,6 +20,8 @@ Taskboard Agent Orchestrator
     -> LangGraph thread/checkpoint
     -> plan_stepsとstep結果の状態管理
     -> 初回実行、差し戻し、再開の状態遷移
+    -> issue単位の会話sessionとmodel-visible contextの組み立て
+    -> session checkpoint、recent turns、active artifact参照の管理
   -> TaskOrchestrator
     -> 計画作成
     -> 1step実行の部品提供
@@ -79,6 +81,14 @@ stepは配列から削除せず、statusを更新して監査可能にする。
 - `result`
 - `error`
 - `artifacts`
+
+## チケット会話コンテキスト
+
+Redmine issue IDをsession ID、journalをconversation turnとして扱う。Redmineは完全な会話台帳、LangGraph checkpointは実行状態とmodel-visible context、checkpoint DB隣接のartifact storeは長文成果物の正本を担う。
+
+モデル入力は、決定的に更新する`working_memory`、古い会話を圧縮した`session_checkpoint`、未圧縮の`recent_turns`、`active_artifacts`のメタデータ、今回選択したartifact本文から都度組み立てる。計画・進捗・tool内部ログはconversation turnに含めない。全履歴を毎回モデルへ渡さず、context windowに対する出力予約と安全bufferを差し引いた閾値を超える場合だけ、担当プロフィールと同じLLMで古いturnをStrict JSONへ圧縮する。
+
+全assistant正規回答とstep/tool成果物はcontent-addressed JSONとして保存し、LangGraph stateには`ArtifactRef`だけを保持する。`depends_on`は同一TaskPlan内の依存、複数turn間の継続はsession contextとartifact参照で表現する。
 
 ## Redmine連携方針
 

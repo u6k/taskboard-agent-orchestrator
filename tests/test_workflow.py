@@ -15,6 +15,7 @@ AGENT = AgentProfileConfig(
     redmine_user_id=42,
     redmine_api_key="redmine-key",
     llm_model="test-model",
+    context_window_tokens=128000,
     llm_api_key="llm-key",
 )
 

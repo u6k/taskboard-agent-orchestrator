@@ -19,6 +19,7 @@ class AgentProfileConfig:
     redmine_user_id: int
     redmine_api_key: str = field(repr=False)
     llm_model: str
+    context_window_tokens: int
     llm_api_key: str = field(repr=False)
     llm_api_base: str | None = None
     llm_timeout_seconds: int | None = None
@@ -81,8 +82,8 @@ def _load_agent_profiles(path: Path) -> tuple[AgentProfileConfig, ...]:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"agent config file is not valid TOML: {path}: {exc}") from exc
 
-    if data.get("version") != 1:
-        raise ConfigError("agent config version must be 1")
+    if data.get("version") != 2:
+        raise ConfigError("agent config version must be 2")
     raw_agents = data.get("agents")
     if not isinstance(raw_agents, list) or not raw_agents:
         raise ConfigError("agent config must include at least one [[agents]] entry")
@@ -124,6 +125,13 @@ def _parse_agent_profile(
         raw, "redmine_api_key", index=index
     )
     llm_model = _required_profile_string(raw, "llm_model", index=index)
+    context_window_tokens = _required_profile_int(
+        raw, "context_window_tokens", index=index
+    )
+    if context_window_tokens <= 0:
+        raise ConfigError(
+            f"agents[{index}].context_window_tokens must be a positive integer"
+        )
     llm_api_key = _required_profile_string(
         raw,
         "llm_api_key",
@@ -170,6 +178,7 @@ def _parse_agent_profile(
         redmine_user_id=redmine_user_id,
         redmine_api_key=redmine_api_key,
         llm_model=llm_model,
+        context_window_tokens=context_window_tokens,
         llm_api_base=llm_api_base,
         llm_api_key=llm_api_key,
         llm_timeout_seconds=llm_timeout_seconds,

@@ -12,6 +12,7 @@ AGENT = AgentProfileConfig(
     redmine_user_id=42,
     redmine_api_key="redmine-key",
     llm_model="test-model",
+    context_window_tokens=128000,
     llm_api_key="llm-key",
 )
 
@@ -190,6 +191,7 @@ def test_run_daemon_gives_each_agent_one_turn_per_iteration() -> None:
         redmine_user_id=43,
         redmine_api_key="second-redmine-key",
         llm_model="second-model",
+        context_window_tokens=128000,
         llm_api_key="second-llm-key",
     )
     agents = (

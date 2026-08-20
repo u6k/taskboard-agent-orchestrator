@@ -71,8 +71,11 @@ LangGraphによるチケット単位の会話状態管理を担当する。
 - `select_next_step` / `execute_step` / `finalize_execution` でstepを1件ずつ実行する
 - 各stepの `status`, `result`, `error`, `artifacts` をstateに保存する
 - 実行結果のartifactを会話コンテキストとstateに保存する
+- issueをsession、journalをturnとして扱い、モデル入力をcheckpoint、recent turn、working memory、選択artifactから組み立てる
+- 長文成果物はcheckpoint DB隣接のcontent-addressed artifact storeへ保存し、stateには参照だけを保持する
+- context上限に近づいたときだけ古いturnをsession checkpointへ圧縮する
 
-現在のLangGraphは、会話履歴、再開状態、step単位の実行状態を保持する。stepは配列から削除せず、`pending`, `running`, `completed`, `failed`, `needs_user`, `skipped` のstatusで管理する。
+現在のLangGraphは、会話session、再開状態、step単位の実行状態、artifact参照を保持する。stepは配列から削除せず、`pending`, `running`, `completed`, `failed`, `needs_user`, `skipped` のstatusで管理する。完全な会話履歴はRedmine、長文本文はartifact storeに残し、checkpointのmodel-visible contextと分離する。
 
 ### `TaskOrchestrator`
 

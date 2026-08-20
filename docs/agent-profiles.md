@@ -7,7 +7,7 @@
 エージェント固有の設定はTOMLファイルで管理する。CLIは既定で `agents.toml` を読み、グローバルオプション `--config` で別のパスを指定できる。
 
 ```toml
-version = 1
+version = 2
 
 [[agents]]
 id = "research-agent"
@@ -15,6 +15,7 @@ enabled = true
 redmine_user_id = 123
 redmine_api_key = "redmine-api-key-for-research-agent"
 llm_model = "openai/gpt-4.1-mini"
+context_window_tokens = 1047576
 llm_api_base = "https://api.openai.com/v1"
 llm_api_key = "llm-api-key-for-research-agent"
 llm_timeout_seconds = 1200
@@ -28,12 +29,15 @@ system_prompt_file = "agent-prompts/research-agent.md"
 - `redmine_user_id`: 処理対象となるRedmine担当者ID。
 - `redmine_api_key`: この担当者名義でRedmineを読み書きするAPIキー。
 - `llm_model`: LiteLLMへ渡すモデル名。
+- `context_window_tokens`: 必須。利用するモデルまたはローカル推論サーバーに設定した実際のcontext window。正の整数で指定する。
 - `llm_api_base`: 任意。省略時はLiteLLMがモデル名から既定エンドポイントを解決する。
 - `llm_api_key`: LLM APIキー。認証不要のローカルエンドポイントでは空文字を明示できる。
 - `llm_timeout_seconds`: 任意。1回のLLM呼び出しを待つ秒数。正の整数を指定し、省略時はLiteLLMの既定値を使う。
 - `system_prompt_file`: 任意。TOMLファイルからの相対パス。省略時は担当者固有のsystem messageを追加しない。
 
-`id` と `redmine_user_id` はそれぞれ重複できない。指定されたsystem promptファイルは存在し、空でない必要がある。有効なプロフィールが1件もない設定は起動時に拒否する。
+設定形式は`version = 2`だけを受け付ける。`id` と `redmine_user_id` はそれぞれ重複できない。全プロフィールに`context_window_tokens`が必要である。指定されたsystem promptファイルは存在し、空でない必要がある。有効なプロフィールが1件もない設定は起動時に拒否する。
+
+例の`gpt-4.1-mini`は公式モデル仕様の1,047,576 tokenを設定している。LM Studioなどローカル推論サーバーでは、モデル名から推測せず、実際のロード設定値と一致させる。
 
 今回はAPIキーをTOMLから直接読む。SecretVaultや暗号化された参照は扱わない。将来のSecretVault対応では、TOML解析と実行時プロフィール生成の境界で秘密情報の取得元を差し替える。
 

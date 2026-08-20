@@ -89,3 +89,4 @@ Accepted
 - [ADR-0005: Use LangChain Tools and Agent Loop](0005-use-langchain-tools-and-agent-loop.md)
 - [ADR-0006: Add Single Process Polling Daemon](0006-add-single-process-polling-daemon.md)
 - [ADR-0007: Use Redmine Assignee Agent Profiles](0007-use-redmine-agent-profiles.md)
+- [ADR-0008: Use Ticket Sessions and Content-addressed Artifacts](0008-use-ticket-sessions-and-content-addressed-artifacts.md)

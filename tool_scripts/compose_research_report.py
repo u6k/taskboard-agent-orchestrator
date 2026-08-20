@@ -8,6 +8,7 @@ from langchain.tools import tool
 from langchain_core.tools import BaseTool
 
 from taskboard_agent.tool_loader import ToolRuntimeContext
+from taskboard_agent.llm import complete_with_operation
 
 
 MAX_INPUT_CHARS = 220000
@@ -73,7 +74,8 @@ def create_tool(context: ToolRuntimeContext) -> BaseTool:
             return {"ok": False, "error": str(exc)}
 
         try:
-            response = llm.complete(
+            response = complete_with_operation(
+                llm,
                 [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
@@ -98,6 +100,7 @@ def create_tool(context: ToolRuntimeContext) -> BaseTool:
                     },
                 ],
                 response_format=_response_format(),
+                operation="compose_research_report",
             )
             data = json.loads(_strip_json_fence(response.content))
             report = _validate_report(data)

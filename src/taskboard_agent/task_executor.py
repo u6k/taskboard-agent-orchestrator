@@ -8,7 +8,7 @@ from typing import Any, Literal, Protocol
 
 from langchain_core.tools import BaseTool
 
-from taskboard_agent.llm import LLMResponse
+from taskboard_agent.llm import LLMResponse, complete_with_operation
 from taskboard_agent.skill_runtime import (
     GenericSkillRunner,
     ScriptedSkillRunner,
@@ -53,6 +53,7 @@ class TaskLLMPort(Protocol):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = "auto",
         response_format: dict[str, Any] | None = None,
+        operation: str = "completion",
     ) -> LLMResponse:
         ...
 
@@ -71,6 +72,9 @@ class TaskStep:
     purpose: str
     name: str | None = None
     arguments: dict[str, Any] | None = None
+    depends_on: tuple[int, ...] = ()
+    input_artifact_ids: tuple[str, ...] = ()
+    output_artifact_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +114,9 @@ class LiteLLMTaskPlanner:
         issue: dict[str, Any],
         skills: list[Skill],
         tools: list[dict[str, Any]],
+        *,
+        context_messages: list[dict[str, Any]] | None = None,
+        artifact_ids: tuple[str, ...] = (),
     ) -> TaskPlan:
         messages: list[dict[str, Any]] = [
             {
@@ -126,14 +133,22 @@ class LiteLLMTaskPlanner:
                     "専用toolやskillがない作業でも、LLMの推論・要約・分析・比較・提案・文章作成で進められる場合はllmステップとして計画してください。"
                     "tool/skillステップのnameには、利用可能一覧にある機械名だけを正確に入れ、説明文や表示名を混ぜないでください。"
                     "実行できないことはunavailableステップまたはlimitationsに明示し、それ以外の実行可能な作業は止めずに進める計画にしてください。"
+                    "過去成果物への参照候補が複数あり一意に選べない場合は、推測せずneeds_userで確認してください。"
                     "計画の出力構造はAPI側で指定されています。"
                 ),
             },
             {
                 "role": "user",
-                "content": _build_planning_prompt(issue, skills, tools),
+                "content": _build_planning_prompt(
+                    issue,
+                    skills,
+                    tools,
+                    include_issue=not bool(context_messages),
+                ),
             },
         ]
+        if context_messages:
+            messages[1:1] = context_messages
         last_error: TaskPlanningError | None = None
         response_format = task_plan_response_format(
             skill_names=(skill.name for skill in skills),
@@ -142,16 +157,24 @@ class LiteLLMTaskPlanner:
                 for tool in tools
                 if isinstance((name := tool.get("name")), str)
             ),
+            artifact_ids=artifact_ids,
         )
         for attempt in range(MAX_TASK_PLAN_ATTEMPTS):
-            response = self._llm.complete(
+            response = complete_with_operation(
+                self._llm,
                 messages,
                 response_format=response_format,
+                operation="task_plan",
             )
             try:
                 plan = parse_task_plan(response.content)
                 plan = normalize_task_plan_names(plan, skills=skills, tools=tools)
-                _validate_task_plan(plan, skills=skills, tools=tools)
+                validate_task_plan(
+                    plan,
+                    skills=skills,
+                    tools=tools,
+                    artifact_ids=set(artifact_ids),
+                )
                 return plan
             except TaskPlanningError as exc:
                 last_error = exc
@@ -221,11 +244,13 @@ class GenericTaskRunner:
                 },
                 {"role": "user", "content": _build_generic_prompt(issue)},
             ]
-        response = self._llm.complete(
+        response = complete_with_operation(
+            self._llm,
             messages,
             response_format=(
                 None if conversation_messages else generic_execution_response_format()
             ),
+            operation="llm_step" if conversation_messages else "structured_final",
         )
         if conversation_messages:
             notes = response.content.strip()
@@ -234,6 +259,7 @@ class GenericTaskRunner:
             return SkillExecutionResult(
                 status="dry_run" if dry_run else "processed",
                 events=(SkillEvent("final_review", notes),),
+                assistant_turn_text=notes,
                 dry_run=dry_run,
             )
         return _parse_generic_execution(response.content, dry_run=dry_run)
@@ -328,11 +354,25 @@ class TaskOrchestrator:
             emit_event=emit_event,
         )
 
-    def create_plan(self, issue: dict[str, Any]) -> TaskPlan:
+    def create_plan(
+        self,
+        issue: dict[str, Any],
+        *,
+        context_messages: list[dict[str, Any]] | None = None,
+        artifact_ids: tuple[str, ...] = (),
+    ) -> TaskPlan:
+        if context_messages is None and not artifact_ids:
+            return self._planner.plan(
+                issue,
+                self._skill_registry.list(),
+                self._tool_catalog.summaries(),
+            )
         return self._planner.plan(
             issue,
             self._skill_registry.list(),
             self._tool_catalog.summaries(),
+            context_messages=context_messages,
+            artifact_ids=artifact_ids,
         )
 
     def planning_catalog(self) -> tuple[list[Skill], list[dict[str, Any]]]:
@@ -377,8 +417,6 @@ class TaskOrchestrator:
         skills, tools = self.planning_catalog()
         plan = normalize_task_plan_names(plan, skills=skills, tools=tools)
         execution_issue = dict(issue)
-        if conversation_messages:
-            execution_issue["conversation_context"] = conversation_messages
         if plan.steps:
             if emit_event is not None and announce_plan:
                 emit_event(_plan_start_event(plan))
@@ -514,6 +552,7 @@ class TaskOrchestrator:
             status=status,
             events=tuple(events),
             artifacts=tuple(artifacts),
+            assistant_turn_text=_last_assistant_text(events),
             dry_run=dry_run,
         )
 
@@ -613,13 +652,15 @@ class TaskOrchestrator:
         except (ToolExecutionError, RuntimeError) as exc:
             return _needs_user_result(f"必要なtool `{step.name}` が不足しています。\n理由: {exc}")
         selected_tool = tool_by_name(tools, step.name)
-        arguments, repair_events = _repair_tool_step_arguments(
+        arguments, repair_events, conflict = _repair_tool_step_arguments(
             tool=selected_tool,
             step=step,
             plan=plan,
             issue=issue,
             step_context=step_context,
         )
+        if conflict:
+            return _needs_user_result(conflict)
         arguments, schema_events = _normalize_tool_arguments_for_schema(
             tool=selected_tool,
             tool_name=step.name,
@@ -793,13 +834,15 @@ class TaskOrchestrator:
                 "content": f"直前の失敗内容:\n{_event_notes(failed_result.events)}",
             },
         ]
-        arguments, repair_events = _repair_tool_step_arguments(
+        arguments, repair_events, conflict = _repair_tool_step_arguments(
             tool=selected_tool,
             step=step,
             plan=plan,
             issue=issue,
             step_context=repaired_context,
         )
+        if conflict:
+            return _needs_user_result(conflict)
         arguments, schema_events = _normalize_tool_arguments_for_schema(
             tool=selected_tool,
             tool_name=step.name,
@@ -960,19 +1003,35 @@ def _repair_tool_step_arguments(
     plan: TaskPlan,
     issue: dict[str, Any],
     step_context: list[dict[str, Any]],
-) -> tuple[dict[str, Any], list[SkillEvent]]:
+) -> tuple[dict[str, Any], list[SkillEvent], str | None]:
     arguments = dict(step.arguments or {})
     schema = _tool_input_schema(tool)
     required = schema.get("required")
     properties = schema.get("properties")
     if not isinstance(required, list) or not isinstance(properties, dict):
-        return arguments, []
+        return arguments, [], None
 
     events: list[SkillEvent] = []
     for field in required:
         if not isinstance(field, str) or field in arguments:
             continue
         property_schema = properties.get(field)
+        artifact_values = _selected_artifact_field_values(issue, field)
+        if len(artifact_values) > 1:
+            return (
+                arguments,
+                events,
+                f"tool `{step.name}` の不足引数 `{field}` に複数の成果物候補があります。参照する成果物を指定してください。",
+            )
+        if artifact_values:
+            arguments[field] = artifact_values[0]
+            events.append(
+                SkillEvent(
+                    "progress",
+                    f"tool `{step.name}` の不足引数 `{field}` を指定成果物の同名fieldから補完しました。",
+                )
+            )
+            continue
         if field == "query" and _schema_accepts_string(property_schema):
             query = _infer_query_argument(
                 step=step,
@@ -988,7 +1047,25 @@ def _repair_tool_step_arguments(
                         f"tool `{step.name}` の不足引数 `{field}` を文脈から補完しました: {query}",
                     )
                 )
-    return arguments, events
+    return arguments, events, None
+
+
+def _selected_artifact_field_values(issue: dict[str, Any], field: str) -> list[Any]:
+    selected = issue.get("selected_artifacts")
+    if not isinstance(selected, list):
+        return []
+    values: list[Any] = []
+    serialized: set[str] = set()
+    for item in selected:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, dict) or field not in content:
+            continue
+        value = content[field]
+        key = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        if key not in serialized:
+            values.append(value)
+            serialized.add(key)
+    return values
 
 
 def _normalize_tool_arguments_for_schema(
@@ -1126,7 +1203,6 @@ def _query_context_sources(
             _task_input_text(plan.task_input),
             str(issue.get("subject") or ""),
             str(issue.get("description") or ""),
-            json.dumps(issue.get("conversation_context"), ensure_ascii=False),
         )
         if isinstance(item, str) and item.strip()
     )
@@ -1207,12 +1283,20 @@ def _parse_task_steps(
         arguments = _parse_step_arguments(_normalize_json_null(item.get("arguments")))
         if arguments is not None and not isinstance(arguments, dict):
             raise TaskPlanningError("task plan step arguments must be an object or null")
+        depends_on = _parse_positive_int_tuple(item.get("depends_on", []), "depends_on")
+        input_artifact_ids = _parse_string_tuple(
+            item.get("input_artifact_ids", []), "input_artifact_ids"
+        )
+        output_artifact_name = _non_empty_str_or_none(item.get("output_artifact_name"))
         steps.append(
             TaskStep(
                 kind=kind,
                 purpose=normalized_purpose,
                 name=name.strip() if isinstance(name, str) else None,
                 arguments=arguments,
+                depends_on=depends_on,
+                input_artifact_ids=input_artifact_ids,
+                output_artifact_name=output_artifact_name,
             )
         )
     return tuple(steps)
@@ -1265,17 +1349,29 @@ def _parse_string_tuple(value: Any, label: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value if item.strip())
 
 
+def _parse_positive_int_tuple(value: Any, label: str) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(
+        isinstance(item, int) and not isinstance(item, bool) and item > 0
+        for item in value
+    ):
+        raise TaskPlanningError(f"task plan {label} must be a positive integer array")
+    return tuple(value)
+
+
 def _normalize_json_null(value: Any) -> Any:
     if isinstance(value, str) and value.strip().lower() == "null":
         return None
     return value
 
 
-def _validate_task_plan(
+def validate_task_plan(
     plan: TaskPlan,
     *,
     skills: list[Skill],
     tools: list[dict[str, Any]],
+    artifact_ids: set[str] | None = None,
 ) -> None:
     skill_names = {skill.name for skill in skills}
     tool_names = {
@@ -1283,14 +1379,27 @@ def _validate_task_plan(
         for tool in tools
         if isinstance((name := tool.get("name")), str) and name
     }
+    known_artifact_ids = artifact_ids or set()
     if plan.steps:
-        for step in plan.steps:
+        for step_index, step in enumerate(plan.steps, 1):
             if step.kind == "skill" and step.name not in skill_names:
                 raise TaskPlanningError(f"step referenced unknown skill: {step.name}")
             if step.kind == "tool" and step.name not in tool_names:
                 raise TaskPlanningError(f"step referenced unknown tool: {step.name}")
             if step.kind in ("skill", "tool") and not step.name:
                 raise TaskPlanningError(f"{step.kind} step requires name")
+            if len(set(step.depends_on)) != len(step.depends_on):
+                raise TaskPlanningError("step depends_on contains duplicate references")
+            if any(item >= step_index for item in step.depends_on):
+                raise TaskPlanningError("step depends_on must reference earlier steps")
+            if len(set(step.input_artifact_ids)) != len(step.input_artifact_ids):
+                raise TaskPlanningError("step input_artifact_ids contains duplicate references")
+            unknown_artifacts = set(step.input_artifact_ids) - known_artifact_ids
+            if unknown_artifacts:
+                raise TaskPlanningError(
+                    "step referenced unknown artifacts: "
+                    + ", ".join(sorted(unknown_artifacts))
+                )
         return
     if plan.decision == "use_skill":
         if plan.skill_name is None:
@@ -1375,6 +1484,7 @@ def _parse_tool_execution(
         briefing=_string_or_none(data.get("briefing")),
         bookmark_url=_string_or_none(data.get("bookmark_url")),
         bookmark_payload=_dict_or_none(data.get("bookmark_payload")),
+        assistant_turn_text=notes.strip(),
         dry_run=dry_run,
     )
 
@@ -1391,11 +1501,13 @@ def _parse_generic_execution(output: str, *, dry_run: bool) -> SkillExecutionRes
         return SkillExecutionResult(
             status="dry_run" if dry_run else "processed",
             events=(SkillEvent("final_review", notes.strip()),),
+            assistant_turn_text=notes.strip(),
             dry_run=dry_run,
         )
     return SkillExecutionResult(
         status=status,
         events=(SkillEvent("final_review", notes.strip()),),
+        assistant_turn_text=notes.strip(),
         dry_run=dry_run,
     )
 
@@ -1426,6 +1538,7 @@ def _tool_result_execution(
             SkillEvent("progress", f"toolを実行しました: {tool_result.name}"),
             event,
         ),
+        assistant_turn_text=event.notes,
         dry_run=dry_run,
     )
 
@@ -1449,6 +1562,7 @@ def _fallback_tool_execution_from_artifacts(
                     SkillEvent("progress", f"toolを実行しました: {', '.join(tool_names)}"),
                     SkillEvent("final_return", f"Web検索に失敗しました。\n理由: {error}"),
                 ),
+                assistant_turn_text=f"Web検索に失敗しました。\n理由: {error}",
                 dry_run=dry_run,
             )
         artifact = content.get("context_artifact")
@@ -1466,6 +1580,10 @@ def _fallback_tool_execution_from_artifacts(
                             "取得済みの検索結果から報告を作成しました。"
                         ),
                     ),
+                ),
+                assistant_turn_text=(
+                    "tool実行後の最終JSON生成が空または不正だったため、"
+                    "取得済みの検索結果から報告を作成しました。"
                 ),
                 dry_run=dry_run,
             )
@@ -1515,6 +1633,7 @@ def _append_events(
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
         artifacts=result.artifacts,
+        assistant_turn_text=result.assistant_turn_text,
         dry_run=result.dry_run,
     )
 
@@ -1536,6 +1655,7 @@ def _merge_recovery_result(
         bookmark_url=retry_result.bookmark_url,
         bookmark_payload=retry_result.bookmark_payload,
         artifacts=retry_result.artifacts,
+        assistant_turn_text=retry_result.assistant_turn_text,
         dry_run=retry_result.dry_run,
     )
 
@@ -1569,19 +1689,19 @@ def _result_context_messages(
             ),
         }
     ]
-    for artifact in result.artifacts:
-        messages.append(
-            {
-                "role": "assistant",
-                "content": f"ステップ {index} 成果JSON:\n{json.dumps(artifact, ensure_ascii=False)}",
-            }
-        )
     return messages
 
 
 def _event_notes(events: tuple[SkillEvent, ...]) -> str:
     notes = [event.notes for event in events if event.notes]
     return "\n\n".join(notes) if notes else "(なし)"
+
+
+def _last_assistant_text(events: list[SkillEvent]) -> str | None:
+    for event in reversed(events):
+        if event.kind in ("final_review", "final_return") and event.notes:
+            return event.notes
+    return None
 
 
 def _step_final_notes(*, plan: TaskPlan, status: str) -> str:
@@ -1604,6 +1724,7 @@ def _needs_user_result(notes: str) -> SkillExecutionResult:
     return SkillExecutionResult(
         status="needs_user",
         events=(SkillEvent("final_review", notes),),
+        assistant_turn_text=notes,
     )
 
 
@@ -1625,6 +1746,7 @@ def _prepend_plan_event(
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
         artifacts=result.artifacts,
+        assistant_turn_text=result.assistant_turn_text,
         dry_run=result.dry_run,
     )
 
@@ -1644,6 +1766,7 @@ def _drop_start_event(result: SkillExecutionResult) -> SkillExecutionResult:
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
         artifacts=result.artifacts,
+        assistant_turn_text=result.assistant_turn_text,
         dry_run=result.dry_run,
     )
 
@@ -1664,6 +1787,7 @@ def _insert_after_start(
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
         artifacts=result.artifacts,
+        assistant_turn_text=result.assistant_turn_text,
         dry_run=result.dry_run,
     )
 
@@ -1700,6 +1824,8 @@ def _build_planning_prompt(
     issue: dict[str, Any],
     skills: list[Skill],
     tools: list[dict[str, Any]],
+    *,
+    include_issue: bool = True,
 ) -> str:
     skill_summaries = [skill.summary() for skill in skills]
     return (
@@ -1726,6 +1852,9 @@ def _build_planning_prompt(
         "- skillステップはnameに利用可能なskillのnameを正確に入れる。説明文、表示名、括弧付き表記を混ぜない。\n"
         "- ユーザーが `web_search_pages` のようなtool名を明示した場合、nameにはその文字列だけを入れる。\n"
         "- argumentsには実行引数をkey/value配列で入れる。例: [{\"key\":\"query\",\"value\":\"検索語\"}]。引数が不要な場合はnullにする。\n"
+        "- depends_onには同一計画内で完了が必要な先行step番号を1始まりで入れる。自己・未来stepは指定しない。\n"
+        "- input_artifact_idsにはartifact catalogに存在し、このstepで本文を読む成果物IDだけを入れる。\n"
+        "- output_artifact_nameには生成成果物の安定した論理名を入れ、不要ならnullにする。\n"
         "- llmステップはname=null、purposeにLLMで行う作業を具体的に入れる。\n"
         "- unavailableステップはname=null、purposeに実行できない作業と理由を入れる。\n"
         "- limitationsには未確認事項、外部制約、実行できないことを短く列挙する。\n"
@@ -1733,7 +1862,11 @@ def _build_planning_prompt(
         "出力構造と型はAPI側で指定されています。\n\n"
         f"利用可能なスキル:\n{json.dumps(skill_summaries, ensure_ascii=False)}\n\n"
         f"利用可能なtool:\n{json.dumps(tools, ensure_ascii=False)}\n\n"
-        f"チケット:\n{json.dumps(_issue_context(issue), ensure_ascii=False)}"
+        + (
+            f"チケット:\n{json.dumps(_issue_context(issue), ensure_ascii=False)}"
+            if include_issue
+            else "チケット本文と直近user turnはsession contextに含まれています。"
+        )
     )
 
 
