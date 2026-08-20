@@ -14,7 +14,9 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_litellm import ChatLiteLLM
 
 from taskboard_agent.agent import LangChainAgentRunner
+from taskboard_agent.artifacts import FileArtifactStore, InMemoryArtifactStore
 from taskboard_agent.config import AppConfig, ConfigError, load_config
+from taskboard_agent.context_engine import ContextEngine
 from taskboard_agent.daemon import AgentExecutionContext, DaemonResult, run_daemon
 from taskboard_agent.linkace import LinkAceClient, LinkAceError
 from taskboard_agent.logging_config import configure_logging, log_trace
@@ -149,6 +151,7 @@ def build_runtime(*, dry_run: bool, config_path: str | Path = "agents.toml") -> 
     skill_registry = SkillRegistry(Path("skills"))
     if dry_run:
         checkpointer_context = nullcontext(InMemorySaver())
+        artifact_store = InMemoryArtifactStore()
     else:
         config.langgraph_checkpoint_db_path.parent.mkdir(
             parents=True, exist_ok=True
@@ -156,18 +159,22 @@ def build_runtime(*, dry_run: bool, config_path: str | Path = "agents.toml") -> 
         checkpointer_context = SqliteSaver.from_conn_string(
             str(config.langgraph_checkpoint_db_path)
         )
+        artifact_store = FileArtifactStore(
+            config.langgraph_checkpoint_db_path.parent / "artifacts"
+        )
     with checkpointer_context as checkpointer:
         ai_user_ids = {agent.redmine_user_id for agent in config.agents}
         agent_contexts: list[AgentExecutionContext] = []
         for profile in config.agents:
             logger.info(
                 "エージェントruntimeを構築します agent_id=%s "
-                "redmine_user_id=%s model=%s api_base=%s timeout_seconds=%s",
+                "redmine_user_id=%s model=%s api_base=%s timeout_seconds=%s context_window_tokens=%s",
                 profile.id,
                 profile.redmine_user_id,
                 profile.llm_model,
                 profile.llm_api_base,
                 profile.llm_timeout_seconds,
+                profile.context_window_tokens,
             )
             redmine = RedmineClient(config.redmine_url, profile.redmine_api_key)
             llm = LiteLLMClient(
@@ -215,6 +222,12 @@ def build_runtime(*, dry_run: bool, config_path: str | Path = "agents.toml") -> 
                 llm=llm,
                 checkpointer=checkpointer,
                 ai_user_ids=ai_user_ids,
+                context_engine=ContextEngine(
+                    llm=llm,
+                    artifact_store=artifact_store,
+                    context_window_tokens=profile.context_window_tokens,
+                ),
+                artifact_store=artifact_store,
             )
             agent_contexts.append(
                 AgentExecutionContext(

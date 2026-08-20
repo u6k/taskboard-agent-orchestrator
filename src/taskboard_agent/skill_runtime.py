@@ -61,6 +61,7 @@ class SkillExecutionResult:
     bookmark_url: str | None = None
     bookmark_payload: dict[str, Any] | None = None
     artifacts: tuple[dict[str, Any], ...] = ()
+    assistant_turn_text: str | None = None
     dry_run: bool = False
 
 
@@ -227,6 +228,7 @@ def _to_skill_execution_result(
         briefing=_string_or_none(final.get("briefing")),
         bookmark_url=_string_or_none(final.get("bookmark_url")),
         bookmark_payload=_dict_or_none(final.get("bookmark_payload")),
+        assistant_turn_text=notes.strip(),
         dry_run=dry_run,
     )
 
@@ -294,6 +296,7 @@ def _insert_after_start(
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
         artifacts=result.artifacts,
+        assistant_turn_text=result.assistant_turn_text,
         dry_run=result.dry_run,
     )
 
@@ -314,6 +317,7 @@ def _with_tool_artifacts(
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
         artifacts=(*result.artifacts, *artifacts),
+        assistant_turn_text=result.assistant_turn_text,
         dry_run=result.dry_run,
     )
 
@@ -438,5 +442,6 @@ def _add_agent_completion_notes(result: SkillExecutionResult) -> SkillExecutionR
         bookmark_url=result.bookmark_url,
         bookmark_payload=result.bookmark_payload,
         artifacts=result.artifacts,
+        assistant_turn_text=result.assistant_turn_text,
         dry_run=result.dry_run,
     )

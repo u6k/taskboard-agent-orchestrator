@@ -8,6 +8,7 @@ from langchain.tools import tool
 from langchain_core.tools import BaseTool
 
 from taskboard_agent.tool_loader import ToolRuntimeContext
+from taskboard_agent.llm import complete_with_operation
 
 
 MAX_INPUT_CHARS = 200_000
@@ -55,7 +56,8 @@ def create_tool(context: ToolRuntimeContext) -> BaseTool:
                 "error": f"抽出本文が{MAX_INPUT_CHARS}文字を超えています。",
             }
         try:
-            response = llm.complete(
+            response = complete_with_operation(
+                llm,
                 [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
@@ -70,6 +72,7 @@ def create_tool(context: ToolRuntimeContext) -> BaseTool:
                     },
                 ],
                 response_format=_response_format(),
+                operation="summarize_weekly_docx",
             )
             data = json.loads(_strip_json_fence(response.content))
             report = _validate_report(data)

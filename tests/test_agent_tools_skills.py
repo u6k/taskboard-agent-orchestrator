@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 from typing import Any
 
 import pytest
@@ -131,6 +132,34 @@ def test_langchain_agent_runner_executes_tool_calls_until_final_response() -> No
     assert result.stopped_reason == "final"
     assert result.tool_results[0].content == {"text": "hello"}
     assert model.calls == 2
+
+
+def test_langchain_agent_runner_logs_metrics_without_message_bodies(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    @tool
+    def echo(text: str) -> dict[str, Any]:
+        """Echo text."""
+        return {"text": text}
+
+    model = FakeChatModel(responses=[AIMessage(content="secret-output")])
+    caplog.set_level(logging.INFO, logger="taskboard_agent.llm")
+
+    LangChainAgentRunner(model=model).run(
+        [{"role": "user", "content": "secret-input"}],
+        tools=[echo],
+        operation="skill_agent",
+    )
+
+    metric = next(
+        record.getMessage()
+        for record in caplog.records
+        if '"event": "llm_call"' in record.getMessage()
+    )
+    assert '"operation": "skill_agent"' in metric
+    assert '"tool_count": 1' in metric
+    assert "secret-input" not in metric
+    assert "secret-output" not in metric
 
 
 def test_langchain_agent_runner_applies_profile_system_prompt() -> None:

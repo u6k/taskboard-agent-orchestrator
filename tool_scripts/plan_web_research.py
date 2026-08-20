@@ -7,6 +7,7 @@ from langchain.tools import tool
 from langchain_core.tools import BaseTool
 
 from taskboard_agent.tool_loader import ToolRuntimeContext
+from taskboard_agent.llm import complete_with_operation
 
 
 MAX_INPUT_CHARS = 30000
@@ -54,7 +55,8 @@ def create_tool(context: ToolRuntimeContext) -> BaseTool:
             return {"ok": False, "error": "issue_jsonはJSON objectにしてください。"}
 
         try:
-            response = llm.complete(
+            response = complete_with_operation(
+                llm,
                 [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
@@ -68,6 +70,7 @@ def create_tool(context: ToolRuntimeContext) -> BaseTool:
                     },
                 ],
                 response_format=_response_format(),
+                operation="plan_web_research",
             )
             plan = _validate_plan(json.loads(_strip_json_fence(response.content)))
         except Exception as exc:

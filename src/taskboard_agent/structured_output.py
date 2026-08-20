@@ -7,10 +7,15 @@ def task_plan_response_format(
     *,
     skill_names: Iterable[str],
     tool_names: Iterable[str],
+    artifact_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     return _response_format(
         "task_plan",
-        _task_plan_schema(skill_names=skill_names, tool_names=tool_names),
+        _task_plan_schema(
+            skill_names=skill_names,
+            tool_names=tool_names,
+            artifact_ids=artifact_ids,
+        ),
     )
 
 
@@ -18,6 +23,7 @@ def revision_plan_response_format(
     *,
     skill_names: Iterable[str],
     tool_names: Iterable[str],
+    artifact_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     return _response_format(
         "revision_plan",
@@ -32,6 +38,7 @@ def revision_plan_response_format(
                 "task_plan": _task_plan_schema(
                     skill_names=skill_names,
                     tool_names=tool_names,
+                    artifact_ids=artifact_ids,
                 ),
             },
             "required": [
@@ -120,10 +127,12 @@ def _task_plan_schema(
     *,
     skill_names: Iterable[str],
     tool_names: Iterable[str],
+    artifact_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     skills = sorted({name for name in skill_names if name})
     tools = sorted({name for name in tool_names if name})
     step_names = sorted({*skills, *tools})
+    artifacts = sorted({item for item in artifact_ids if item})
     return {
         "type": "object",
         "properties": {
@@ -181,8 +190,27 @@ def _task_plan_schema(
                                 {"type": "null"},
                             ]
                         },
+                        "depends_on": {
+                            "type": "array",
+                            "items": {"type": "integer", "minimum": 1},
+                            "uniqueItems": True,
+                        },
+                        "input_artifact_ids": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": artifacts},
+                            "uniqueItems": True,
+                        },
+                        "output_artifact_name": {"type": ["string", "null"]},
                     },
-                    "required": ["kind", "name", "purpose", "arguments"],
+                    "required": [
+                        "kind",
+                        "name",
+                        "purpose",
+                        "arguments",
+                        "depends_on",
+                        "input_artifact_ids",
+                        "output_artifact_name",
+                    ],
                     "additionalProperties": False,
                 },
             },

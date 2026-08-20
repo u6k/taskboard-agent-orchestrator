@@ -817,7 +817,7 @@ def test_orchestrator_runs_step_plan_with_tool_then_llm() -> None:
     assert "作業ステップ" in result.events[0].notes
     assert "社内規程への適合は未確認" in result.events[0].notes
     assert any("企業内活用案を提案しました" in (event.notes or "") for event in result.events)
-    assert "企業内の自動化に活用できるAIエージェント" in str(generic._llm.messages[0])
+    assert "企業内の自動化に活用できるAIエージェント" not in str(generic._llm.messages[0])
 
 
 def test_orchestrator_repairs_missing_web_search_query_from_previous_step() -> None:
@@ -926,7 +926,7 @@ def test_orchestrator_executes_single_tool_step() -> None:
     assert execution.events[0] == SkillEvent("progress", "ステップ 1 を実行しました: OpenClawを検索する")
     assert execution.artifacts[0]["type"] == "web_search_pages"
     assert "ステップ 1 実行結果" in execution.context_messages[0]["content"]
-    assert "ステップ 1 成果JSON" in execution.context_messages[1]["content"]
+    assert len(execution.context_messages) == 1
 
 
 def test_orchestrator_executes_single_skill_step() -> None:

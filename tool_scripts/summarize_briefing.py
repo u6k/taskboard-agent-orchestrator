@@ -6,6 +6,7 @@ from langchain.tools import tool
 from langchain_core.tools import BaseTool
 
 from taskboard_agent.tool_loader import ToolRuntimeContext
+from taskboard_agent.llm import complete_with_operation
 
 
 BRIEFING_PROMPT = (
@@ -34,7 +35,8 @@ def create_tool(context: ToolRuntimeContext) -> BaseTool:
             text: 要約対象の抽出本文。
         """
         try:
-            response = llm.complete(
+            response = complete_with_operation(
+                llm,
                 [
                     {"role": "system", "content": BRIEFING_PROMPT},
                     {
@@ -45,7 +47,8 @@ def create_tool(context: ToolRuntimeContext) -> BaseTool:
                             text=text[:MAX_INPUT_CHARS],
                         ),
                     },
-                ]
+                ],
+                operation="summarize_briefing",
             )
         except Exception as exc:
             return {"ok": False, "error": str(exc), "url": url, "title": title}

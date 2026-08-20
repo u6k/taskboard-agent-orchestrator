@@ -8,6 +8,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from taskboard_agent.llm import LLMResponse
+from taskboard_agent.artifacts import InMemoryArtifactStore
 from taskboard_agent.skill_runtime import SkillEvent, SkillExecutionResult
 from taskboard_agent.task_executor import TaskPlan, TaskStep, TaskStepExecution
 from taskboard_agent.ticket_graph import TicketConversationGraph
@@ -43,7 +44,11 @@ class FakeOrchestrator:
         self.tools = tools or []
         self.step_statuses = list(step_statuses or [])
 
-    def create_plan(self, issue: dict[str, Any]) -> TaskPlan:
+    def create_plan(
+        self,
+        issue: dict[str, Any],
+        **_kwargs: Any,
+    ) -> TaskPlan:
         return self.plan
 
     def planning_catalog(self) -> tuple[list[Any], list[dict[str, Any]]]:
@@ -81,6 +86,7 @@ class FakeOrchestrator:
             briefing="保存済みの要約本文",
             bookmark_url="https://bookmark.test/links/1",
             artifacts=self.artifacts,
+            assistant_turn_text="保存済みの要約本文",
         )
 
     def plan_notes(self, plan: TaskPlan) -> str:
@@ -117,10 +123,7 @@ class FakeOrchestrator:
         dry_run: bool = False,
         step_context: list[dict[str, Any]] | None = None,
     ) -> TaskStepExecution:
-        is_revision = any(
-            "差し戻し" in str(message.get("content", ""))
-            for message in (step_context or [])
-        )
+        is_revision = plan.task_input is not None or plan.reason != self.plan.reason
         self.executions.append(
             {
                 "issue": issue,
@@ -182,6 +185,7 @@ class FakeOrchestrator:
             briefing="保存済みの要約本文",
             bookmark_url="https://bookmark.test/links/1",
             artifacts=self.artifacts,
+            assistant_turn_text="保存済みの要約本文",
             dry_run=dry_run,
         )
         return TaskStepExecution(
@@ -251,9 +255,10 @@ def test_initial_run_creates_ticket_conversation_and_interrupts() -> None:
     assert SkillEvent("progress", "作業結果を確認してください。") in events
     assert events[-1] == SkillEvent("final_review", "作業が終了しました。")
     state = graph.conversation_state(123)
-    assert isinstance(state["messages"][0], HumanMessage)
-    assert "案内文を作成してください" in state["messages"][0].content
-    assert isinstance(state["messages"][-1], AIMessage)
+    assert state["messages"] == []
+    assert state["recent_turns"][0]["role"] == "user"
+    assert "案内文を作成してください" in state["recent_turns"][0]["content"]
+    assert state["recent_turns"][-1]["role"] == "assistant"
 
 
 def test_initial_run_treats_all_configured_agent_journals_as_ai_messages() -> None:
@@ -273,15 +278,15 @@ def test_initial_run_treats_all_configured_agent_journals_as_ai_messages() -> No
         )
     )
 
-    messages = graph.conversation_state(123)["messages"]
-    agent_message = next(
-        message for message in messages if message.content == "別エージェントの結果"
+    turns = graph.conversation_state(123)["recent_turns"]
+    agent_turn = next(
+        turn for turn in turns if turn["content"] == "別エージェントの結果"
     )
-    human_message = next(
-        message for message in messages if message.content == "人間からのコメント"
+    human_turn = next(
+        turn for turn in turns if turn["content"] == "人間からのコメント"
     )
-    assert isinstance(agent_message, AIMessage)
-    assert isinstance(human_message, HumanMessage)
+    assert agent_turn["role"] == "assistant"
+    assert human_turn["role"] == "user"
 
 
 def test_initial_plan_steps_are_saved_in_graph_state() -> None:
@@ -325,57 +330,16 @@ def test_initial_plan_steps_are_saved_in_graph_state() -> None:
     assert state["step_context"]["limitations"] == ["外部承認は未取得"]
     assert state["step_context"]["execution_model"] == "langgraph_step_loop"
     assert state["step_context"]["last_result_status"] == "processed"
-    assert state["plan_steps"] == [
-        {
-            "id": "step-1",
-            "index": 0,
-            "kind": "llm",
-            "name": None,
-            "purpose": "依頼内容を整理する",
-            "arguments": {"format": "bullets"},
-            "status": "completed",
-            "result": {
-                "status": "processed",
-                "target_url": "https://example.test/article",
-                "page_title": "Article",
-                "briefing": "保存済みの要約本文",
-                "bookmark_url": "https://bookmark.test/links/1",
-                "bookmark_payload": None,
-                "artifacts": [],
-                "dry_run": False,
-            },
-            "error": None,
-            "artifacts": [
-                {
-                    "target_url": "https://example.test/article",
-                    "page_title": "Article",
-                    "briefing": "保存済みの要約本文",
-                    "bookmark_url": "https://bookmark.test/links/1",
-                }
-            ],
-        },
-        {
-            "id": "step-2",
-            "index": 1,
-            "kind": "unavailable",
-            "name": None,
-            "purpose": "外部承認が必要な作業は実行しない",
-            "arguments": None,
-            "status": "skipped",
-            "result": {
-                "status": "skipped",
-                "target_url": None,
-                "page_title": None,
-                "briefing": None,
-                "bookmark_url": None,
-                "bookmark_payload": None,
-                "artifacts": [],
-                "dry_run": False,
-            },
-            "error": None,
-            "artifacts": [],
-        },
+    assert [step["status"] for step in state["plan_steps"]] == [
+        "completed",
+        "skipped",
     ]
+    assert all(
+        artifact["artifact_id"]
+        for step in state["plan_steps"]
+        for artifact in step["artifacts"]
+    )
+    assert "保存済みの要約本文" not in str(state["plan_steps"])
     assert SkillEvent("progress", "ステップ 1 を開始しました: 依頼内容を整理する") in events
     assert SkillEvent("progress", "ステップ 1 を完了しました: 依頼内容を整理する") in events
     assert SkillEvent("progress", "ステップ 2 を開始しました: 外部承認が必要な作業は実行しない") in events
@@ -487,9 +451,10 @@ def test_resume_adds_only_new_human_comment_and_publishes_revision_first() -> No
     state = graph.conversation_state(123)
     assert state["last_ingested_journal_id"] == 2
     assert state["feedback_analysis"]["requested_changes"] == ["短くする"]
+    assert state["active_artifacts"]["assistant-answer"]["version"] == 2
     assert sum(
-        "文章が長いので短くしてください" in str(message.content)
-        for message in state["messages"]
+        "文章が長いので短くしてください" in turn["content"]
+        for turn in state["recent_turns"]
     ) == 1
 
     duplicate_events: list[SkillEvent] = []
@@ -604,14 +569,13 @@ def test_resume_question_is_planned_and_executed_from_conversation() -> None:
     planner_messages = llm.calls[0]
     assert "保存済みの作業状態と成果物" not in str(planner_messages)
     assert any("保存済みの要約本文" in message["content"] for message in planner_messages)
-    assert "差し戻されました" in planner_messages[-1]["content"]
-    assert "作業を説明してください" in planner_messages[-1]["content"]
+    assert planner_messages[-1]["content"] == "作業を説明してください。"
     execution_messages = orchestrator.executions[-1]["conversation_messages"]
     assert any("保存済みの要約本文" in message["content"] for message in execution_messages)
     state = graph.conversation_state(123)
-    assert any(
-        isinstance(message, AIMessage) and message.content == "要約を作成しました。"
-        for message in state["messages"]
+    assert not any(
+        turn["content"] == "要約を作成しました。"
+        for turn in state["recent_turns"]
     )
 
 
@@ -681,7 +645,8 @@ def test_revision_plan_preserves_step_based_work() -> None:
     ]
 
 
-def test_search_artifact_is_saved_to_conversation_context() -> None:
+def test_search_artifact_is_saved_by_reference_without_conversation_duplication() -> None:
+    long_text = "長" * 90_000
     artifact = {
         "type": "web_search_pages",
         "query": "生成AI",
@@ -699,22 +664,26 @@ def test_search_artifact_is_saved_to_conversation_context() -> None:
                 "url": "https://example.test/article",
                 "final_url": "https://example.test/article",
                 "title": "検索結果",
-                "text": "保存される本文",
+                "text": long_text,
                 "text_truncated": False,
                 "fetch_ok": True,
                 "error": None,
             }
         ],
     }
+    artifact_store = InMemoryArtifactStore()
     graph = TicketConversationGraph(
         task_orchestrator=FakeOrchestrator(artifacts=(artifact,)),  # type: ignore[arg-type]
         llm=FakeLLM([]),
         checkpointer=InMemorySaver(),
         ai_user_ids={42},
+        artifact_store=artifact_store,
     )
 
     graph.run(issue=_issue())
 
     state = graph.conversation_state(123)
-    assert state["artifacts"][0] == artifact
-    assert any("保存される本文" in str(message.content) for message in state["messages"])
+    assert state["artifacts"][0]["artifact_id"]
+    assert long_text not in str(state)
+    stored = artifact_store.get(state["artifacts"][0]["artifact_id"])
+    assert stored["pages"][0]["text"] == long_text

@@ -174,6 +174,25 @@
 - LiteLLM直接呼び出しとChatLiteLLM agentへ同じモデル、endpoint、APIキー、任意のタイムアウトとsystem promptを適用する
 - 設定済みの全RedmineエージェントユーザーをLangGraph会話上のAI投稿者として扱う
 
+## Phase 7: Redmineチケット会話をセッション化する
+
+目的:
+
+- issue IDをsession ID、journalをconversation turnとして扱う
+- LLM入力を全履歴ではなく、session checkpoint、recent turns、working memory、選択artifactから組み立てる
+- 長文成果物をcontent-addressed artifact storeへ分離し、LangGraph stateの肥大化を防ぐ
+- context window閾値に応じた自動compactionと、本文を含めない共通LLM計測を追加する
+
+完了条件:
+
+- `agents.toml` version 2で各プロフィールの`context_window_tokens`を必須検証する
+- user/assistant turnとRedmine progressイベントが分離される
+- 全assistant正規回答とstep/tool成果物がartifact化され、stateには参照だけが残る
+- planning、revision、step executionは選択されたmodel-visible contextだけを受け取る
+- context超過時に古いturnをStrict JSON checkpointへ圧縮し、単一入力超過は`needs_user`になる
+- 既存checkpointは次回再開時に遅延変換し、既存SQLite行を一括変更しない
+- LiteLLM直接呼び出しとLangChain経路で本文を含めない構造化計測を記録する
+
 ## 実装時の原則
 
 - 1回の変更で複数Phaseをまとめて実装しない

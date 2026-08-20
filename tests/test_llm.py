@@ -98,7 +98,7 @@ def test_litellm_client_does_not_add_empty_profile_system_prompt(
     )
 
 
-def test_litellm_client_logs_prompt_and_response(
+def test_litellm_client_logs_metrics_without_prompt_and_response(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -113,8 +113,12 @@ def test_litellm_client_logs_prompt_and_response(
     )
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any("LLM入力プロンプト" in message and "hello" in message for message in messages)
-    assert any("LLM出力内容" in message and "こんにちは" in message for message in messages)
+    metric = next(message for message in messages if '"event": "llm_call"' in message)
+    assert '"message_count": 1' in metric
+    assert '"input_chars":' in metric
+    assert '"output_chars": 5' in metric
+    assert "hello" not in metric
+    assert "こんにちは" not in metric
 
 
 def test_litellm_client_reads_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
