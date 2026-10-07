@@ -25,6 +25,8 @@ class AgentProfileConfig:
     llm_timeout_seconds: int | None = None
     system_prompt: str | None = field(default=None, repr=False)
     system_prompt_file: Path | None = None
+    llm_reasoning_effort: str | None = None
+    llm_reasoning_backend: str | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,14 @@ def _parse_agent_profile(
         index=index,
     )
 
+    from taskboard_agent.reasoning import validate_reasoning_config
+
+    effort = _optional_profile_string(raw, "llm_reasoning_effort", index=index)
+    backend = _optional_profile_string(raw, "llm_reasoning_backend", index=index)
+    for key in ("llm_reasoning_effort", "llm_reasoning_backend"):
+        if key in raw and (not isinstance(raw[key], str) or not raw[key].strip()):
+            raise ConfigError(f"agents[{index}].{key} must be a non-empty string")
+    validate_reasoning_config(llm_model, backend, effort)
     prompt_value = raw.get("system_prompt_file")
     system_prompt_file: Path | None = None
     system_prompt: str | None = None
@@ -184,6 +194,8 @@ def _parse_agent_profile(
         llm_timeout_seconds=llm_timeout_seconds,
         system_prompt=system_prompt,
         system_prompt_file=system_prompt_file,
+        llm_reasoning_effort=effort,
+        llm_reasoning_backend=backend,
     )
 
 

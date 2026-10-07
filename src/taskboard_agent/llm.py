@@ -11,6 +11,7 @@ import litellm
 from langchain_core.callbacks import BaseCallbackHandler
 
 from taskboard_agent.logging_config import current_trace_id
+from taskboard_agent.reasoning import reasoning_kwargs
 
 
 logger = logging.getLogger(__name__)
@@ -47,8 +48,11 @@ class LiteLLMClient:
         api_key: str | None = None,
         timeout_seconds: int | None = None,
         system_prompt: str | None = None,
+        reasoning_backend: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._model = model
+        self._reasoning_kwargs = reasoning_kwargs(model, reasoning_backend, reasoning_effort)
         self._api_base = api_base
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
@@ -85,6 +89,7 @@ class LiteLLMClient:
             "model": self._model,
             "messages": with_agent_system_prompt(messages, self._system_prompt),
         }
+        kwargs.update(self._reasoning_kwargs)
         if self._api_base is not None:
             kwargs["base_url"] = self._api_base
         if self._api_key is not None:

@@ -53,6 +53,31 @@ Redmine URL、ステータスID、LinkAce、LangGraph checkpointなど全エー�
 
 system promptがある場合は、計画、再計画、LLM step、tool/skill agent、toolやscripted skill内部のLLM処理へ補助system messageとして適用する。共通のStructured Outputs、tool policy、dry-run、承認、Redmine更新規則を優先し、プロフィールのpromptからそれらを変更できないようにする。
 
+## Thinking制御
+
+任意の`llm_reasoning_effort`には`none`, `low`, `medium`, `high`を指定する。
+指定時は`llm_reasoning_backend` (`strata`, `ollama`, `openai_compatible`)も必須。
+省略時は追加パラメーターを送らず、既存動作を維持する。backendだけの指定は拒否する。
+設定はLiteLLM直接呼び出しとChatLiteLLMの両方に適用する。
+
+```toml
+# StrataのOpenAI互換接続にはopenai/モデル名を使用する。
+llm_reasoning_backend = "strata"
+llm_reasoning_effort = "none"
+```
+
+Strataには`extra_body`で`reasoning_effort`を送る。`none`はthinking無効化、
+`low`は思考を残す最小段階であり、時間やtoken数の上限ではない。
+Ollamaでは起動時に`/api/show`の`thinking.values`を検証する。取得失敗や
+非対応値は起動エラーとし、既定値へフォールバックしない。
+`ollama/`経路では`think`へ変換し、`none`を`false`、各段階を同名文字列にする。
+OpenAI互換接続では`reasoning_effort`を送る。Ollamaの接続先は明示する必要がある。
+`openai_compatible`はLiteLLMの通常引数と対応検証を使用する。
+非対応エラー時に指定を外して再試行しない。
+`lm_studio/`での思考量指定は拒否する。LM Studio独自APIへの対応は今回の対象外。
+StrataとOpenAI互換接続には`openai/`経路を使用し、
+Ollamaには`ollama/`, `ollama_chat/`, または`openai/`経路を使用する。
+
 ## CLIと巡回規則
 
 1件実行ではプロフィールを明示する。

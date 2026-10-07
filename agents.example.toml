@@ -10,6 +10,9 @@ context_window_tokens = 1047576
 llm_api_base = "https://api.openai.com/v1"
 llm_api_key = "replace-with-llm-api-key"
 llm_timeout_seconds = 600
+# Strataのopenai/接続では次の2項目でthinkingを無効化できる。
+# llm_reasoning_backend = "strata"
+# llm_reasoning_effort = "none"
 system_prompt_file = "agent-prompts/research-agent.md"
 
 [[agents]]

@@ -91,11 +91,13 @@ version = 2
 id = "first"
 redmine_user_id = 42
 redmine_api_key = "redmine-first"
-llm_model = "provider/first"
+llm_model = "openai/first"
 context_window_tokens = 128000
 llm_api_base = "https://first.example.test/v1"
 llm_api_key = "llm-first"
 llm_timeout_seconds = 300
+llm_reasoning_backend = "strata"
+llm_reasoning_effort = "none"
 
 [[agents]]
 id = "second"
@@ -133,7 +135,7 @@ llm_timeout_seconds = 1200
         ]
         direct_llms = [context.task_executor._llm for context in runtime.agents]
         assert [llm.model for llm in direct_llms] == [
-            "provider/first",
+            "openai/first",
             "provider/second",
         ]
         assert [llm.api_base for llm in direct_llms] == [
@@ -145,10 +147,11 @@ llm_timeout_seconds = 1200
     assert redmine_keys == ["redmine-first", "redmine-second"]
     assert chat_calls == [
         {
-            "model": "provider/first",
+            "model": "openai/first",
             "api_base": "https://first.example.test/v1",
             "api_key": "llm-first",
             "request_timeout": 300,
+            "model_kwargs": {"extra_body": {"reasoning_effort": "none"}},
         },
         {
             "model": "provider/second",
