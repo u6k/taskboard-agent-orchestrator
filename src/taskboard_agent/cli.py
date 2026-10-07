@@ -21,6 +21,7 @@ from taskboard_agent.daemon import AgentExecutionContext, DaemonResult, run_daem
 from taskboard_agent.linkace import LinkAceClient, LinkAceError
 from taskboard_agent.logging_config import configure_logging, log_trace
 from taskboard_agent.llm import LiteLLMClient
+from taskboard_agent.reasoning import reasoning_kwargs, validate_ollama_capabilities
 from taskboard_agent.page import PageFetchError, WebPageExtractor
 from taskboard_agent.redmine import RedmineClient, RedmineError
 from taskboard_agent.skills import SkillRegistry, SkillRegistryError
@@ -145,6 +146,13 @@ def build_parser() -> argparse.ArgumentParser:
 @contextmanager
 def build_runtime(*, dry_run: bool, config_path: str | Path = "agents.toml") -> Iterator[Runtime]:
     config = load_config(agents_file=config_path)
+    # Validate remote capabilities before constructing clients or persistent stores.
+    for profile in config.agents:
+        if profile.llm_reasoning_backend == "ollama":
+            validate_ollama_capabilities(
+                profile.llm_model, profile.llm_api_base, profile.llm_reasoning_effort,
+                timeout=profile.llm_timeout_seconds, api_key=profile.llm_api_key,
+            )
     page_fetcher = WebPageExtractor()
     search_client = DuckDuckGoSearchClient()
     bookmark_client = LinkAceClient(config.linkace_url, config.linkace_api_key)
@@ -166,6 +174,9 @@ def build_runtime(*, dry_run: bool, config_path: str | Path = "agents.toml") -> 
         ai_user_ids = {agent.redmine_user_id for agent in config.agents}
         agent_contexts: list[AgentExecutionContext] = []
         for profile in config.agents:
+            model_kwargs = reasoning_kwargs(
+                profile.llm_model, profile.llm_reasoning_backend, profile.llm_reasoning_effort,
+            )
             logger.info(
                 "エージェントruntimeを構築します agent_id=%s "
                 "redmine_user_id=%s model=%s api_base=%s timeout_seconds=%s context_window_tokens=%s",
@@ -183,12 +194,15 @@ def build_runtime(*, dry_run: bool, config_path: str | Path = "agents.toml") -> 
                 api_key=profile.llm_api_key,
                 timeout_seconds=profile.llm_timeout_seconds,
                 system_prompt=profile.system_prompt,
+                reasoning_backend=profile.llm_reasoning_backend,
+                reasoning_effort=profile.llm_reasoning_effort,
             )
             chat_model = ChatLiteLLM(
                 model=profile.llm_model,
                 api_base=profile.llm_api_base,
                 api_key=profile.llm_api_key,
                 request_timeout=profile.llm_timeout_seconds,
+                **({"model_kwargs": model_kwargs} if model_kwargs else {}),
             )
             skill_agent = LangChainAgentRunner(
                 model=chat_model,
